@@ -210,3 +210,41 @@ test('PelisPlus retains an existing empty episode when neither route exposes ser
   assert.equal(episode.servers.length, 0);
   assert.ok(episode.url.includes('/anime/empty-anime/'));
 });
+
+test('PelisPlus retries an empty full title once using its stable colon prefix', async () => {
+  const queries = [];
+  const api = service('pelisplus', { fetchHtml: async url => {
+    const query = new URL(url).searchParams.get('s');
+    queries.push(query);
+    return query === 'Spider-Man' ? '<a class="Posters-link" href="/pelicula/spider-man-un-nuevo-dia" data-title="VER Spider-Man: Un nuevo dÃ­a Online Gratis HD"></a>' : '<p>Sin resultados</p>';
+  } });
+  const result = await api.searchContent('Spider-Man: Un nuevo día');
+  assert.deepEqual(queries, ['Spider-Man: Un nuevo día', 'Spider-Man']);
+  assert.equal(result[0].slug, 'spider-man-un-nuevo-dia');
+  assert.equal(result[0].title, 'Spider-Man: Un nuevo día');
+});
+
+test('PelisPlus retries only an empty accented query with its legacy database spelling', async () => {
+  const queries = [];
+  const api = service('pelisplus', { fetchHtml: async url => {
+    const query = new URL(url).searchParams.get('s');
+    queries.push(query);
+    return query === 'El niÃ±o' ? cards : '';
+  } });
+  assert.equal((await api.searchContent('El niño'))[0].title, 'El niño');
+  assert.deepEqual(queries, ['El niño', 'El niÃ±o']);
+});
+
+test('PelisPlus does not broaden a successful search or loop after an empty fallback', async () => {
+  const successful = [];
+  const api = service('pelisplus', { fetchHtml: async url => { successful.push(url); return cards; } });
+  assert.equal((await api.searchContent('Spider-Man: Un nuevo día')).length, 2);
+  assert.equal(successful.length, 1);
+  const empty = [];
+  const missing = service('pelisplus', { fetchHtml: async url => { empty.push(new URL(url).searchParams.get('s')); return ''; } });
+  assert.deepEqual(await missing.searchContent('Spider-Man: Missing'), []);
+  assert.deepEqual(empty, ['Spider-Man: Missing', 'Spider-Man']);
+  empty.length = 0;
+  assert.deepEqual(await missing.searchContent('Matrix'), []);
+  assert.deepEqual(empty, ['Matrix']);
+});

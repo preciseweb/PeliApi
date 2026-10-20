@@ -42,43 +42,59 @@ function extractSlugFromPath(path) {
  * Busca contenido en PelisPlus
  */
 async function searchContent(query) {
-  if (!query) {
+  if (typeof query !== 'string' || !query.trim()) {
     throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
   }
+  query = query.trim();
+  async function searchOnce(searchQuery) {
+    const url = `${BASE_URL}/search?s=${encodeURIComponent(searchQuery)}`;
+    const html = await fetchHtml(url);
+    const $ = cheerio.load(html);
+    const results = [];
 
-  const url = `${BASE_URL}/search?s=${encodeURIComponent(query)}`;
-  const html = await fetchHtml(url);
-  const $ = cheerio.load(html);
-  const results = [];
+    $("a.Posters-link").each((_, element) => {
+      const el = $(element);
+      const href = el.attr("href") || "";
+      const title = cleanTitle(el.attr("data-title") || el.find(".listing-content p").text());
+      const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("data-src") || el.find("img.Posters-img").attr("src") || "");
+      const ratingText = el.find(".rating span").text().trim();
+      const rating = ratingText ? ratingText.split("/")[0] : null;
+      const type = detectTypeFromPath(href);
+      const slug = extractSlugFromPath(href);
 
-  $("a.Posters-link").each((_, element) => {
-    const el = $(element);
-    const href = el.attr("href") || "";
-    const title = cleanTitle(el.attr("data-title") || el.find(".listing-content p").text());
-    const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("data-src") || el.find("img.Posters-img").attr("src") || "");
-    const ratingText = el.find(".rating span").text().trim();
-    const rating = ratingText ? ratingText.split("/")[0] : null;
-    const type = detectTypeFromPath(href);
-    const slug = extractSlugFromPath(href);
+      if (slug && title) {
+        results.push({
+          id: slug,
+          slug,
+          title,
+          poster,
+          rating,
+          type,
+          url: getAbsoluteUrl(href),
+        });
+      }
+    });
 
-    if (slug && title) {
-      results.push({
-        id: slug,
-        slug,
-        title,
-        poster,
-        rating,
-        type,
-        url: getAbsoluteUrl(href),
-      });
-    }
-  });
+    return [...results.reduce((unique, item) => {
+      const key = `${item.type}:${item.slug}`;
+      if (!unique.has(key)) unique.set(key, item);
+      return unique;
+    }, new Map()).values()];
+  }
 
-  return [...results.reduce((unique, item) => {
-    const key = `${item.type}:${item.slug}`;
-    if (!unique.has(key)) unique.set(key, item);
-    return unique;
-  }, new Map()).values()];
+  const results = await searchOnce(query);
+  if (results.length) return results;
+
+  // The source database sometimes stores broken Latin accents, while alternate
+  // titles and punctuation also make an otherwise valid full title return zero.
+  // Retry only once: a stable title prefix, or the source's legacy byte spelling.
+  const prefix = query.split(/[:：]/, 1)[0].trim();
+  let fallback = prefix !== query && prefix.length >= 3 ? prefix : '';
+  if (!fallback && /[\u00c0-\u024f]/.test(query)) {
+    fallback = new TextDecoder('windows-1252').decode(Buffer.from(query, 'utf8'));
+  }
+  if (!fallback || fallback === query) return results;
+  return searchOnce(fallback);
 }
 
 /**

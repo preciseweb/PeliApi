@@ -253,6 +253,8 @@ La lectura HTML decodifica los bytes según BOM, cabeceras y metadatos de charse
 
 Las rutas conservan los slugs del proveedor y codifican sus segmentos/parámetros al construir solicitudes. Información y servidores distinguen anime y series; el tipo opcional `type=anime` en `/servers` permite elegir la ruta correspondiente. Se conserva la compatibilidad con clientes anteriores. La interfaz envía correctamente títulos/rutas con acentos y evita duplicar la etiqueta «Director».
 
+Si el buscador no devuelve resultados para un título completo, PelisPlus reintenta una sola vez con el prefijo anterior a los dos puntos o con la representación de acentos que conserva la base de datos de origen. El máximo es de dos consultas upstream por búsqueda; el cliente sigue validando el título y el año antes de reproducir.
+
 Pruebas de regresión, sin descargar películas ni invocar resolvedores:
 
 ```sh
