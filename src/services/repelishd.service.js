@@ -1,5 +1,6 @@
 const cheerio = require("cheerio");
-const { fetchHtml } = require("../utils/http");
+const { fetchHtml, decodeHtmlBuffer } = require("../utils/http");
+const { cleanText, cleanTitle, absoluteUrl, normalizeSlug, encodedSlug, episodeNumbers } = require("./content.helpers");
 const { ApiError } = require("../utils/api-error");
 const axios = require("axios");
 
@@ -9,11 +10,7 @@ const BASE_URL = process.env.REPELISHD_DOMAIN || "https://repelishd.ceo";
  * Normaliza las URLs para que siempre sean absolutas
  */
 function getAbsoluteUrl(path) {
-  if (!path) return "";
-  if (path.startsWith("http://") || path.startsWith("https://")) {
-    return path;
-  }
-  return `${BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
+  return absoluteUrl(path, BASE_URL);
 }
 
 /**
@@ -30,6 +27,8 @@ async function searchContent(query) {
   try {
     const response = await axios.post(url, postData, {
       timeout: 15000,
+      responseType: "arraybuffer",
+      transformResponse: [],
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -38,7 +37,7 @@ async function searchContent(query) {
       },
     });
 
-    const $ = cheerio.load(response.data);
+    const $ = cheerio.load(decodeHtmlBuffer(response.data, response.headers?.["content-type"]));
     const results = [];
 
     // En DLE, los resultados de búsqueda están contenidos dentro de div#dle-content
@@ -51,17 +50,20 @@ async function searchContent(query) {
       const poster = getAbsoluteUrl(img.attr("src") || img.attr("data-src") || "");
       
       const titleLink = el.find(".data h3 a");
-      const title = titleLink.text().trim();
+      const title = cleanTitle(titleLink.text());
 
       const ratingText = posterDiv.find(".rating").text().trim();
       const rating = ratingText ? ratingText : null;
       
       const yearText = el.find(".data span, .poster span").text().trim();
-      const year = yearText ? yearText.replace("HD", "").trim() : null;
+      const year = yearText.match(/(?:18|19|20|21)\d{2}/)?.[0] || null;
 
-      const slug = href.split("/ver-pelicula/").pop().replace(".html", "");
+      const path = getAbsoluteUrl(href);
+      const match = path && new URL(path).pathname.match(/^\/ver-pelicula\/([^/]+)\.html\/?$/);
+      let slug = "";
+      try { if (match) slug = normalizeSlug(match[1]); } catch {}
 
-      if (slug) {
+      if (slug && title) {
         results.push({
           id: slug,
           slug,
@@ -100,32 +102,35 @@ async function getContentInfo(slug, type = "movie") {
     throw new ApiError(400, "El slug del contenido es requerido");
   }
 
-  const path = `/ver-pelicula/${slug}.html`;
+  if (type !== "movie") throw new ApiError(404, "RePelisHD no ofrece episodios de series o anime");
+  slug = normalizeSlug(slug.replace(/\.html$/, ""), { prefixes: ["ver-pelicula"] });
+  const path = `/ver-pelicula/${encodedSlug(slug)}.html`;
   const url = `${BASE_URL}${path}`;
   
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
-  const title = $("h1").not(".text").text().replace(" online HD", "").replace(" online", "").trim() || $(".title").first().text().trim() || "";
+  const title = cleanTitle($("h1").not(".text").first().text() || $(".title").first().text());
   if (!title) {
     throw new ApiError(404, "Contenido no encontrado en RePelisHD");
   }
 
-  const synopsis = $(".description p").text().trim() || $(".description").text().trim() || "";
+  const synopsis = cleanText($(".description p").text() || $(".description").first().text());
   const poster = getAbsoluteUrl($(".poster img").first().attr("src") || $(".poster img").first().attr("data-src") || "");
 
   let year = null;
-  const yearMatch = $(".meta, .info, body").text().match(/\d{4}/);
+  const yearMatch = ($("meta[property=\"video:release_date\"]").attr("content") || $(".meta, .info, time").text()).match(/(?:18|19|20|21)\d{2}/);
   if (yearMatch) year = yearMatch[0];
 
   let rating = $(".starstruck-rating, .dt_rating_vgs").first().text().trim() || null;
 
   const genres = [];
   $('a[href*="/genero/"]').each((_, el) => {
-    const text = $(el).text().trim();
+    if ($(el).closest("nav, header, footer, .navbar, .menu, .dropdown-menu").length) return;
+    const text = cleanText($(el).text());
     const href = $(el).attr("href") || "";
     const gSlug = href.split("/genero/").pop().replace(/\//g, "");
-    if (text && !genres.some(g => g.slug === gSlug)) {
+    if (text && !genres.some(g => g.name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase() === text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase())) {
       genres.push({ name: text, slug: gSlug });
     }
   });
@@ -149,8 +154,8 @@ async function getContentInfo(slug, type = "movie") {
   const servers = [];
   
   // Buscar iframe del resolver en la página de RePelisHD
-  const iframeSrc = $("iframe").first().attr("src") || $("iframe").first().attr("data-src") || "";
-  if (iframeSrc && iframeSrc.includes("verhdlink.cam")) {
+  const iframeSrc = getAbsoluteUrl($("iframe").first().attr("data-src") || $("iframe").first().attr("src") || "");
+  if (iframeSrc && /(^|\.)verhdlink\.cam$/i.test(new URL(iframeSrc).hostname)) {
     try {
       // Cargar el player resolver enviando cabecera Referer
       const resolverHtml = await fetchHtml(iframeSrc, { Referer: url });
@@ -167,10 +172,11 @@ async function getContentInfo(slug, type = "movie") {
         r$(`ul.${lang.key} li`).each((_, el) => {
           const mirror = r$(el);
           const dataLink = mirror.attr("data-link") || "";
-          let text = mirror.text().trim().toLowerCase();
+          let text = cleanText(mirror.text()).toLowerCase();
 
           if (dataLink) {
-            let embedUrl = dataLink;
+            let embedUrl = absoluteUrl(dataLink, iframeSrc);
+            if (!embedUrl) return;
             if (embedUrl.startsWith("//")) {
               embedUrl = `https:${embedUrl}`;
             }
@@ -210,7 +216,7 @@ async function getContentInfo(slug, type = "movie") {
     }
   }
 
-  contentInfo.servers = servers;
+  contentInfo.servers = [...new Map(servers.map(server => [`${server.embedUrl}\n${server.language}`, server])).values()];
   return contentInfo;
 }
 
@@ -218,13 +224,8 @@ async function getContentInfo(slug, type = "movie") {
  * Placeholder para compatibilidad con series
  */
 async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
-  return {
-    serieSlug,
-    season: Number(seasonNumber),
-    episode: Number(episodeNumber),
-    servers: [],
-    url: "",
-  };
+  episodeNumbers(seasonNumber, episodeNumber);
+  throw new ApiError(404, 'RePelisHD no ofrece episodios de series o anime');
 }
 
 module.exports = {

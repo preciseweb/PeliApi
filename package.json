@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "check": "node --check src/server.js"
+    "check": "node --check src/server.js",
+    "test": "node --test"
   },
   "keywords": [
     "pelisplus",

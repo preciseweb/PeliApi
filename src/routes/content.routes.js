@@ -6,6 +6,7 @@ const repelishdService = require("../services/repelishd.service");
 const downloadService = require("../services/download.service");
 const { resolveEmbedUrl } = require("../utils/resolvers");
 const { ApiError } = require("../utils/api-error");
+const { episodeNumbers } = require("../services/content.helpers");
 
 const router = express.Router();
 
@@ -29,9 +30,10 @@ router.use(dailyRateLimit);
 router.get(
   "/search",
   asyncHandler(async (req, res) => {
-    const query = req.query.s || req.query.q || "";
+    const rawQuery = req.query.s || req.query.q || "";
+    const query = typeof rawQuery === "string" ? rawQuery.trim() : "";
 
-    if (!query) {
+    if (!query || query.length > 200) {
       throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
     }
 
@@ -159,8 +161,10 @@ router.get(
   "/info/*",
   asyncHandler(async (req, res) => {
     const slug = req.params[0];
-    const type = req.query.type || "movie"; // movie, series, anime
+    const type = req.query.type || (slug.startsWith("anime/") ? "anime" : slug.startsWith("serie/") ? "series" : "movie"); // movie, series, anime
     let provider = req.query.provider;
+    if (!["movie", "series", "anime"].includes(type)) throw new ApiError(400, "Tipo de contenido no válido");
+    if (provider && !["pelisplus", "repelishd", "cuevana3"].includes(provider)) throw new ApiError(400, "Proveedor no válido");
 
     // Auto-detectar si el slug contiene "/" o tiene el patrón de RePelisHD
     if (!provider) {
@@ -185,7 +189,7 @@ router.get(
       data = await service.getContentInfo(slug, type);
     } catch (error) {
       // Si falló y estábamos intentando con PelisPlus, intentamos en cascada
-      if (provider === "pelisplus") {
+      if (provider === "pelisplus" && error.statusCode !== 400) {
         try {
           console.log(`Cascading info request to RePelisHD for slug: ${slug}`);
           data = await repelishdService.getContentInfo(slug, type);
@@ -226,17 +230,19 @@ router.get(
   "/servers",
   asyncHandler(async (req, res) => {
     const slug = req.query.slug || req.query.serieSlug;
-    const season = Number(req.query.season || 1);
-    const episode = Number(req.query.episode || 1);
+    const { seasonNumber: season, episodeNumber: episode } = episodeNumbers(req.query.season ?? 1, req.query.episode ?? 1);
+    const type = req.query.type || (typeof slug === 'string' && slug.startsWith('anime/') ? 'anime' : 'series');
     let provider = req.query.provider;
+    if (!['series', 'anime'].includes(type)) throw new ApiError(400, 'Tipo de episodio no válido');
+    if (provider && !['pelisplus', 'repelishd', 'cuevana3'].includes(provider)) throw new ApiError(400, 'Proveedor no válido');
 
-    if (!slug) {
+    if (typeof slug !== 'string' || !slug.trim()) {
       throw new ApiError(400, "El parametro 'slug' de la serie es requerido");
     }
 
     // Auto-detectar si el slug contiene "/" o tiene el patrón de RePelisHD
     if (!provider) {
-      if (slug.includes("/")) {
+      if (slug.includes("/") && !slug.startsWith("serie/") && !slug.startsWith("anime/")) {
         provider = "cuevana3";
       } else if (slug.includes("-online-espanol")) {
         provider = "repelishd";
@@ -254,17 +260,17 @@ router.get(
       else if (provider === "repelishd") service = repelishdService;
       else service = pelisplusService;
 
-      data = await service.getEpisodeServers(slug, season, episode);
+      data = await service.getEpisodeServers(slug, season, episode, type);
     } catch (error) {
-      if (provider === "pelisplus") {
+      if (provider === "pelisplus" && error.statusCode !== 400) {
         try {
           console.log(`Cascading servers request to RePelisHD for slug: ${slug}`);
-          data = await repelishdService.getEpisodeServers(slug, season, episode);
+          data = await repelishdService.getEpisodeServers(slug, season, episode, type);
           source = "repelishd";
         } catch (repelisError) {
           try {
             console.log(`Cascading servers request to Cuevana3 for slug: ${slug}`);
-            data = await cuevanaService.getEpisodeServers(slug, season, episode);
+            data = await cuevanaService.getEpisodeServers(slug, season, episode, type);
             source = "cuevana3";
           } catch (cascadeError) {
             console.error("Cuevana3 cascade failed too:", cascadeError.message);

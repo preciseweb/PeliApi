@@ -1,5 +1,6 @@
 const axios = require("axios");
 const { URL } = require("node:url");
+const { TextDecoder } = require("node:util");
 const { ApiError } = require("./api-error");
 
 const DEFAULT_HEADERS = {
@@ -14,16 +15,86 @@ const HTML_HEADERS = {
   "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 };
 
+function supportedCharset(value) {
+  if (!value) return "";
+  try {
+    return new TextDecoder(value).encoding;
+  } catch (_error) {
+    return "";
+  }
+}
+
+function decodeUtf8OrLegacy(bytes) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (_error) {
+    // Keep every valid UTF-8 sequence intact. A single legacy accent in an old
+    // page must not change correctly encoded titles, scripts or URL tokens.
+    const legacy = new TextDecoder("windows-1252");
+    const fragments = [];
+    let start = 0;
+    for (let index = 0; index < bytes.length;) {
+      const first = bytes[index];
+      if (first < 0x80) { index++; continue; }
+      const length = first >= 0xc2 && first <= 0xdf ? 2
+        : first >= 0xe0 && first <= 0xef ? 3 : first >= 0xf0 && first <= 0xf4 ? 4 : 0;
+      let valid = length > 0 && index + length <= bytes.length;
+      for (let offset = 1; valid && offset < length; offset++) {
+        valid = bytes[index + offset] >= 0x80 && bytes[index + offset] <= 0xbf;
+      }
+      const second = bytes[index + 1];
+      if ((first === 0xe0 && second < 0xa0) || (first === 0xed && second > 0x9f)
+        || (first === 0xf0 && second < 0x90) || (first === 0xf4 && second > 0x8f)) valid = false;
+      if (valid) { index += length; continue; }
+      fragments.push(bytes.subarray(start, index).toString("utf8"), legacy.decode(bytes.subarray(index, index + 1)));
+      start = ++index;
+    }
+    fragments.push(bytes.subarray(start).toString("utf8"));
+    return fragments.join("");
+  }
+}
+
+/** Decode transport bytes before parsing HTML. Metadata repair is deliberately
+ * separate: replacing characters throughout HTML can corrupt scripts and URLs. */
+function decodeHtmlBuffer(value, contentType = "") {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  const bytes = Buffer.isBuffer(value) ? value
+    : ArrayBuffer.isView(value) ? Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+      : Buffer.from(value);
+  if (bytes.length === 0) return "";
+
+  // A byte-order mark is stronger evidence than a conflicting server header.
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return decodeUtf8OrLegacy(bytes.subarray(3));
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes);
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes);
+
+  const charset = /charset\s*=\s*["']?\s*([^\s;"'>]+)/i;
+  let encoding = supportedCharset(String(contentType).match(charset)?.[1]);
+  if (!encoding) {
+    const prefix = bytes.subarray(0, 8192).toString("latin1")
+      .replace(/<!--[\s\S]*?-->/g, "").replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+    for (const meta of prefix.match(/<meta\b[^>]*>/gi) || []) {
+      encoding = supportedCharset(meta.match(charset)?.[1]);
+      if (encoding) break;
+    }
+  }
+  if (encoding && encoding !== "utf-8") return new TextDecoder(encoding).decode(bytes);
+  return decodeUtf8OrLegacy(bytes);
+}
+
 async function fetchHtml(url, customHeaders = {}) {
   try {
     const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
     const response = await axios.get(url, {
       timeout,
       headers: { ...HTML_HEADERS, ...customHeaders },
+      responseType: "arraybuffer",
+      transformResponse: [],
       maxRedirects: 5,
       validateStatus: (status) => status >= 200 && status < 400,
     });
-    return response.data;
+    return decodeHtmlBuffer(response.data, response.headers?.["content-type"]);
   } catch (error) {
     throw new ApiError(500, `No se pudo obtener el contenido desde ${url}`, error.message);
   }
@@ -40,11 +111,13 @@ async function fetchHtmlWithHeaders(url, referer, customHeaders = {}) {
     const response = await axios.get(url, {
       timeout,
       headers,
+      responseType: "arraybuffer",
+      transformResponse: [],
       maxRedirects: 5,
       validateStatus: (status) => status >= 200 && status < 400,
     });
 
-    return { html: response.data, headers: response.headers };
+    return { html: decodeHtmlBuffer(response.data, response.headers?.["content-type"]), headers: response.headers };
   } catch (error) {
     throw new ApiError(500, `Error de red al consultar ${url}`, error.message);
   }
@@ -162,6 +235,7 @@ module.exports = {
   HTML_HEADERS,
   fetchHtml,
   fetchHtmlWithHeaders,
+  decodeHtmlBuffer,
   resolveAbsoluteUrl,
   normalizeExtractedUrl,
   decodeIfEncoded,

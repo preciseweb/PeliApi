@@ -1,4 +1,6 @@
 const { scrapeWithPage } = require("../utils/browser");
+const { ApiError } = require("../utils/api-error");
+const { cleanText, cleanTitle, normalizeSlug, encodedSlug, episodeNumbers, repairMetadata } = require("./content.helpers");
 
 /**
  * Busca contenido en Cuevana3 usando Puppeteer
@@ -6,7 +8,7 @@ const { scrapeWithPage } = require("../utils/browser");
 async function searchContent(query) {
   const url = `https://ww9.cuevana3.to/?s=${encodeURIComponent(query)}`;
   
-  return scrapeWithPage(url, () => {
+  const response = await scrapeWithPage(url, () => {
     const results = [];
     const elements = document.querySelectorAll('.MovieList .TPost, .MovieList li, .TPost');
     elements.forEach(el => {
@@ -53,13 +55,15 @@ async function searchContent(query) {
     }
     return uniqueResults;
   });
+  return repairMetadata(response || []).map(item => ({ ...item, title: cleanTitle(item.title) }));
 }
 
 /**
  * Obtiene la información detallada de una película o serie de Cuevana3
  */
 async function getContentInfo(slug, type = "movie") {
-  const url = `https://ww9.cuevana3.to/${slug}`;
+  slug = normalizeSlug(slug, { nested: true });
+  const url = `https://ww9.cuevana3.to/${encodedSlug(slug)}`;
   
   const result = await scrapeWithPage(url, () => {
     const title = document.querySelector('h1.Title')?.textContent.trim() || '';
@@ -91,7 +95,7 @@ async function getContentInfo(slug, type = "movie") {
     };
     
     // Parsear géneros
-    const genreLinks = document.querySelectorAll('a[href*="/genero/"]');
+    const genreLinks = document.querySelectorAll('.InfoList a[href*="/genero/"], .Description a[href*="/genero/"], .Genres a[href*="/genero/"]');
     genreLinks.forEach(g => {
       const gName = g.textContent.trim();
       const gSlug = g.href.split("/").filter(Boolean).pop();
@@ -108,7 +112,7 @@ async function getContentInfo(slug, type = "movie") {
       let iframeIndex = 0;
 
       languageMenus.forEach(langMenu => {
-        const langNameText = langMenu.childNodes[0].textContent.trim();
+        const langNameText = langMenu.childNodes[0]?.textContent.trim() || langMenu.textContent.trim();
         const langName = langNameText.split('CALIDAD')[0].trim();
         
         const serverLiList = langMenu.querySelectorAll('ul li, .clili');
@@ -153,7 +157,7 @@ async function getContentInfo(slug, type = "movie") {
 
       const seasonsMap = new Map();
       episodeLinks.forEach(ep => {
-        const match = ep.href.match(/(\d+)x(\d+)$/);
+        const match = new URL(ep.href).pathname.match(/(\d+)x(\d+)\/?$/);
         if (match) {
           const seasonNum = Number(match[1]);
           const episodeNum = Number(match[2]);
@@ -162,6 +166,7 @@ async function getContentInfo(slug, type = "movie") {
             seasonsMap.set(seasonNum, []);
           }
 
+          if (seasonsMap.get(seasonNum).some(episode => episode.number === episodeNum)) return;
           seasonsMap.get(seasonNum).push({
             number: episodeNum,
             title: `Episodio ${episodeNum}`,
@@ -186,12 +191,14 @@ async function getContentInfo(slug, type = "movie") {
     return info;
   });
 
+  if (!cleanText(result?.title)) throw new ApiError(404, 'Contenido no encontrado en Cuevana3');
   if (result) {
+    result.title = cleanTitle(result.title);
     result.id = slug;
     result.slug = slug;
     result.type = type;
   }
-  return result;
+  return repairMetadata(result);
 }
 
 /**
@@ -199,8 +206,10 @@ async function getContentInfo(slug, type = "movie") {
  */
 async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
   // Los capítulos en Cuevana3 tienen la estructura /episodio/slug-temporadaxcapitulo
-  const coreSlug = serieSlug.replace("serie/", "");
-  const url = `https://ww9.cuevana3.to/episodio/${coreSlug}-${seasonNumber}x${episodeNumber}`;
+  serieSlug = normalizeSlug(serieSlug, { nested: true });
+  ({ seasonNumber, episodeNumber } = episodeNumbers(seasonNumber, episodeNumber));
+  const coreSlug = serieSlug.replace(/^(?:serie|anime)\//, "");
+  const url = `https://ww9.cuevana3.to/episodio/${encodedSlug(coreSlug)}-${seasonNumber}x${episodeNumber}`;
 
   const result = await scrapeWithPage(url, () => {
     const servers = [];
@@ -209,7 +218,7 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
     let iframeIndex = 0;
 
     languageMenus.forEach(langMenu => {
-      const langNameText = langMenu.childNodes[0].textContent.trim();
+      const langNameText = langMenu.childNodes[0]?.textContent.trim() || langMenu.textContent.trim();
       const langName = langNameText.split('CALIDAD')[0].trim();
       
       const serverLiList = langMenu.querySelectorAll('ul li, .clili');
@@ -252,7 +261,7 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
     serieSlug,
     season: Number(seasonNumber),
     episode: Number(episodeNumber),
-    servers: result.servers,
+    servers: repairMetadata(result?.servers || []),
     url
   };
 }

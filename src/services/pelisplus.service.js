@@ -1,6 +1,7 @@
 const cheerio = require("cheerio");
 const { fetchHtml } = require("../utils/http");
 const { ApiError } = require("../utils/api-error");
+const { cleanText, cleanTitle, absoluteUrl, normalizeSlug, encodedSlug, episodeNumbers, uniqueText } = require("./content.helpers");
 
 const BASE_URL = process.env.PELISPLUS_DOMAIN || "https://www.pelisplushd.la";
 
@@ -8,11 +9,7 @@ const BASE_URL = process.env.PELISPLUS_DOMAIN || "https://www.pelisplushd.la";
  * Normaliza las URLs para que siempre apunten a nuestro dominio o sean absolutas
  */
 function getAbsoluteUrl(path) {
-  if (!path) return "";
-  if (path.startsWith("http://") || path.startsWith("https://")) {
-    return path;
-  }
-  return `${BASE_URL}${path.startsWith("/") ? "" : "/"}${path}`;
+  return absoluteUrl(path, BASE_URL);
 }
 
 /**
@@ -30,13 +27,15 @@ function detectTypeFromPath(path) {
  * Extrae el slug a partir del path de PelisPlus
  */
 function extractSlugFromPath(path) {
-  if (!path) return "";
-  const parts = path.split("/").filter(Boolean);
   // Ejemplos:
   // /pelicula/el-padrino -> "el-padrino"
   // /serie/breaking-bad -> "breaking-bad"
   // /anime/naruto -> "naruto"
-  return parts[parts.length - 1] || "";
+  const url = getAbsoluteUrl(path);
+  if (!url) return '';
+  const parts = new URL(url).pathname.split('/').filter(Boolean);
+  if (!['pelicula', 'serie', 'anime'].includes(parts[0]) || parts.length !== 2) return '';
+  try { return normalizeSlug(parts[1]); } catch { return ''; }
 }
 
 /**
@@ -55,14 +54,14 @@ async function searchContent(query) {
   $("a.Posters-link").each((_, element) => {
     const el = $(element);
     const href = el.attr("href") || "";
-    const title = el.attr("data-title") || el.find(".listing-content p").text().trim() || "";
-    const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("src") || "");
+    const title = cleanTitle(el.attr("data-title") || el.find(".listing-content p").text());
+    const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("data-src") || el.find("img.Posters-img").attr("src") || "");
     const ratingText = el.find(".rating span").text().trim();
     const rating = ratingText ? ratingText.split("/")[0] : null;
     const type = detectTypeFromPath(href);
     const slug = extractSlugFromPath(href);
 
-    if (slug) {
+    if (slug && title) {
       results.push({
         id: slug,
         slug,
@@ -75,7 +74,11 @@ async function searchContent(query) {
     }
   });
 
-  return results;
+  return [...results.reduce((unique, item) => {
+    const key = `${item.type}:${item.slug}`;
+    if (!unique.has(key)) unique.set(key, item);
+    return unique;
+  }, new Map()).values()];
 }
 
 /**
@@ -84,7 +87,7 @@ async function searchContent(query) {
 async function getCatalog(type = "movie", genre = "", page = 1) {
   let path = "";
   if (genre) {
-    path = `/generos/${genre}`;
+    path = `/generos/${encodedSlug(normalizeSlug(genre))}`;
   } else {
     switch (type) {
       case "series":
@@ -100,6 +103,7 @@ async function getCatalog(type = "movie", genre = "", page = 1) {
     }
   }
 
+  if (!["movie", "series", "anime"].includes(type) || !Number.isInteger(Number(page)) || Number(page) < 1) throw new ApiError(400, "El tipo o la página del catálogo no son válidos");
   const separator = path.includes("?") ? "&" : "?";
   const url = `${BASE_URL}${path}${separator}page=${page}`;
   const html = await fetchHtml(url);
@@ -109,14 +113,14 @@ async function getCatalog(type = "movie", genre = "", page = 1) {
   $("a.Posters-link").each((_, element) => {
     const el = $(element);
     const href = el.attr("href") || "";
-    const title = el.attr("data-title") || el.find(".listing-content p").text().trim() || "";
-    const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("src") || "");
+    const title = cleanTitle(el.attr("data-title") || el.find(".listing-content p").text());
+    const poster = getAbsoluteUrl(el.find("img.Posters-img").attr("data-src") || el.find("img.Posters-img").attr("src") || "");
     const ratingText = el.find(".rating span").text().trim();
     const rating = ratingText ? ratingText.split("/")[0] : null;
     const contentType = detectTypeFromPath(href);
     const slug = extractSlugFromPath(href);
 
-    if (slug) {
+    if (slug && title) {
       items.push({
         id: slug,
         slug,
@@ -133,7 +137,11 @@ async function getCatalog(type = "movie", genre = "", page = 1) {
   const hasNextPage = $(".pagination a[rel='next']").length > 0 || $(".pagination .page-item:last-child:not(.disabled) a").length > 0;
 
   return {
-    items,
+    items: [...items.reduce((unique, item) => {
+      const key = `${item.type}:${item.slug}`;
+      if (!unique.has(key)) unique.set(key, item);
+      return unique;
+    }, new Map()).values()],
     page: Number(page),
     hasNextPage,
   };
@@ -147,43 +155,55 @@ async function getContentInfo(slug, type = "movie") {
     throw new ApiError(400, "El slug del contenido es requerido");
   }
 
-  const path = type === "movie" ? `/pelicula/${slug}` : `/serie/${slug}`;
-  const url = `${BASE_URL}${path}`;
-  const html = await fetchHtml(url);
-  const $ = cheerio.load(html);
+  if (!['movie', 'series', 'anime'].includes(type)) throw new ApiError(400, 'El tipo de contenido no es válido');
+  slug = normalizeSlug(slug, { prefixes: ['pelicula', 'serie', 'anime'] });
+  const prefixes = type === 'movie' ? ['pelicula'] : type === 'anime' ? ['anime', 'serie'] : ['serie', 'anime'];
+  let url, $, lastError;
+  for (const prefix of prefixes) {
+    url = `${BASE_URL}/${prefix}/${encodedSlug(slug)}`;
+    try {
+      $ = cheerio.load(await fetchHtml(url));
+      if ($('h1.m-b-5, .font-size-26.font-weight-bold').first().text().trim()) break;
+      throw new ApiError(404, 'Contenido no encontrado en PelisPlus');
+    } catch (error) { lastError = error; $ = null; }
+  }
+  if (!$) throw lastError;
 
-  const title = $("h1.m-b-5").text().trim() || $(".font-size-26.font-weight-bold").text().trim() || "";
+  const title = cleanTitle($("h1.m-b-5").first().text() || $(".font-size-26.font-weight-bold").first().text());
   if (!title) {
     throw new ApiError(404, "Contenido no encontrado en PelisPlus");
   }
 
-  const originalTitle = $("p.text-opacity").text().trim() || "";
-  const synopsis = $(".text-large").text().trim() || $("#synopsis").text().trim() || "";
-  const poster = getAbsoluteUrl($("img.img-fluid.m-b-15").attr("src") || $(".img-fluid.rounded").attr("src") || "");
+  const originalTitle = cleanText($("p.text-opacity").first().text()).replace(/^@\s*/, "");
+  const synopsis = cleanText($(".text-large").first().text() || $("#synopsis").first().text());
+  const posterImage = $(".poster img, .movie-poster img, img.img-fluid.m-b-15, img.img-fluid.m-b-30, img.img-fluid.rounded").first();
+  const poster = getAbsoluteUrl(posterImage.attr("data-src") || posterImage.attr("src") || $("meta[property=\"og:image\"]").attr("content") || "");
   const ratingVal = $(".font-size-36.font-weight-bold").text().trim();
   const rating = ratingVal ? ratingVal : null;
   const yearMatch = $(".font-size-18.text-info").text().trim().match(/\d{4}/);
   const year = yearMatch ? yearMatch[0] : null;
 
   const genres = [];
-  $("a[href^='/generos/']").each((_, el) => {
-    const text = $(el).text().trim();
-    const gSlug = $(el).attr("href").split("/").pop();
-    if (text) {
-      genres.push({ name: text, slug: gSlug });
-    }
+  $("a[href*='/generos/']").each((_, el) => {
+    if ($(el).closest('nav, header, footer, .navbar, .dropdown-menu, .nav-item').length) return;
+    const text = cleanText($(el).text());
+    const href = getAbsoluteUrl($(el).attr('href') || '');
+    if (!href) return;
+    const gSlug = new URL(href).pathname.split('/').filter(Boolean).pop();
+    const key = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (text && !genres.some(genre => genre.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase() === key)) genres.push({ name: text, slug: gSlug });
   });
 
-  // Metadatos adicionales (elenco, director)
+  // Metadatos adicionales (elenco, director). Ignore wrappers containing nested fields.
   const cast = [];
   const directors = [];
   $(".sectionDetail").each((_, el) => {
-    const text = $(el).text();
-    if (text.includes("Director:")) {
-      $(el).find("a").each((_, a) => directors.push($(a).text().trim()));
-    } else if (text.includes("Elenco:")) {
-      $(el).find("a").each((_, a) => cast.push($(a).text().trim()));
-    }
+    const field = $(el);
+    if (field.find('.sectionDetail').length) return;
+    const text = cleanText(field.text());
+    const names = field.find('a').map((_, link) => cleanText($(link).text())).get();
+    if (/Director(?:a|es)?\s*:/i.test(text)) directors.push(...names);
+    else if (/(?:Elenco|Actores|Reparto)\s*:/i.test(text)) cast.push(...names);
   });
 
   const contentInfo = {
@@ -196,8 +216,8 @@ async function getContentInfo(slug, type = "movie") {
     rating,
     year,
     genres,
-    cast,
-    directors,
+    cast: uniqueText(cast),
+    directors: uniqueText(directors),
     type,
     url,
   };
@@ -209,81 +229,25 @@ async function getContentInfo(slug, type = "movie") {
     // Si es serie, obtenemos la estructura de temporadas y capítulos
     contentInfo.seasons = [];
     
-    // Las series suelen estructurar temporadas en paneles o listas
-    const seasonsTab = $(".divseason");
-    if (seasonsTab.length > 0) {
-      seasonsTab.each((_, el) => {
-        const seasonTitle = $(el).text().trim();
-        const seasonNumMatch = seasonTitle.match(/\d+/);
-        const seasonNum = seasonNumMatch ? Number(seasonNumMatch[0]) : 1;
-
-        const episodes = [];
-        // Buscar links de episodios correspondientes a esta temporada
-        // Suelen estar dentro del mismo div o relacionados
-        const nextUl = $(el).next("ul");
-        nextUl.find("a").each((_, epLink) => {
-          const epHref = $(epLink).attr("href") || "";
-          const epText = $(epLink).text().trim();
-          
-          // Formato URL: /serie/{slug}/temporada/{n}/capitulo/{n}
-          const epSlugMatch = epHref.match(/temporada\/(\d+)\/capitulo\/(\d+)/i);
-          if (epSlugMatch) {
-            const epNum = Number(epSlugMatch[2]);
-            episodes.push({
-              number: epNum,
-              title: epText || `Episodio ${epNum}`,
-              url: getAbsoluteUrl(epHref),
-              season: seasonNum,
-            });
-          }
-        });
-
-        // Ordenar episodios por número ascendentemente
-        episodes.sort((a, b) => a.number - b.number);
-
-        contentInfo.seasons.push({
-          number: seasonNum,
-          name: seasonTitle || `Temporada ${seasonNum}`,
-          episodes,
-        });
+    // Las series suelen estructurar temporadas en paneles o listas.
+    // Read every episode link, even when .divseason exists without an adjacent ul.
+    const seasonsMap = new Map();
+    $("a[href*='/temporada/']").each((_, epLink) => {
+      const epHref = getAbsoluteUrl($(epLink).attr('href') || '');
+      const match = epHref.match(/\/temporada\/(\d+)\/capitulo\/(\d+)(?:[/?#]|$)/i);
+      if (!match) return;
+      const season = Number(match[1]);
+      const number = Number(match[2]);
+      if (number < 1) return;
+      if (!seasonsMap.has(season)) seasonsMap.set(season, new Map());
+      const episodes = seasonsMap.get(season);
+      if (!episodes.has(number)) episodes.set(number, {
+        number, title: cleanText($(epLink).text()) || `Episodio ${number}`, url: epHref, season,
       });
-
-      // Ordenar temporadas por número ascendentemente
-      contentInfo.seasons.sort((a, b) => a.number - b.number);
-    } else {
-      // Fallback: buscar cualquier enlace de capítulo en la página
-      const episodesMap = new Map();
-      $("a[href*='/temporada/']").each((_, epLink) => {
-        const epHref = $(epLink).attr("href") || "";
-        const epText = $(epLink).text().trim();
-        const match = epHref.match(/temporada\/(\d+)\/capitulo\/(\d+)/i);
-        if (match) {
-          const sNum = Number(match[1]);
-          const eNum = Number(match[2]);
-
-          if (!episodesMap.has(sNum)) {
-            episodesMap.set(sNum, []);
-          }
-
-          episodesMap.get(sNum).push({
-            number: eNum,
-            title: epText || `Episodio ${eNum}`,
-            url: getAbsoluteUrl(epHref),
-            season: sNum,
-          });
-        }
-      });
-
-      for (const [seasonNum, episodes] of episodesMap.entries()) {
-        episodes.sort((a, b) => a.number - b.number);
-        contentInfo.seasons.push({
-          number: seasonNum,
-          name: `Temporada ${seasonNum}`,
-          episodes,
-        });
-      }
-      contentInfo.seasons.sort((a, b) => a.number - b.number);
-    }
+    });
+    contentInfo.seasons = [...seasonsMap].map(([number, episodes]) => ({
+      number, name: `Temporada ${number}`, episodes: [...episodes.values()].sort((a, b) => a.number - b.number),
+    })).sort((a, b) => a.number - b.number);
   }
 
   return contentInfo;
@@ -292,26 +256,23 @@ async function getContentInfo(slug, type = "movie") {
 /**
  * Obtiene los servidores y URLs de reproducción de un episodio específico
  */
-async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
-  if (!serieSlug || !seasonNumber || !episodeNumber) {
-    throw new ApiError(400, "Los parametros serieSlug, seasonNumber y episodeNumber son requeridos");
+async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber, type = 'series') {
+  serieSlug = normalizeSlug(serieSlug, { prefixes: ['serie', 'anime'] });
+  ({ seasonNumber, episodeNumber } = episodeNumbers(seasonNumber, episodeNumber));
+  if (!['series', 'anime'].includes(type)) throw new ApiError(400, 'El tipo de episodio no es válido');
+  const prefixes = type === 'anime' ? ['anime', 'serie'] : ['serie', 'anime'];
+  let lastError;
+  for (const prefix of prefixes) {
+    const url = `${BASE_URL}/${prefix}/${encodedSlug(serieSlug)}/temporada/${seasonNumber}/capitulo/${episodeNumber}`;
+    try {
+      const $ = cheerio.load(await fetchHtml(url));
+      const title = cleanTitle($('h1.m-b-5, .font-size-26.font-weight-bold').first().text());
+      const servers = parseServers($);
+      if (!title && !servers.length) throw new ApiError(404, 'Episodio no encontrado en PelisPlus');
+      return { serieSlug, season: seasonNumber, episode: episodeNumber, title, servers, url };
+    } catch (error) { lastError = error; }
   }
-
-  const url = `${BASE_URL}/serie/${serieSlug}/temporada/${seasonNumber}/capitulo/${episodeNumber}`;
-  const html = await fetchHtml(url);
-  const $ = cheerio.load(html);
-
-  const title = $("h1.m-b-5").text().trim() || "";
-  const servers = parseServers($);
-
-  return {
-    serieSlug,
-    season: Number(seasonNumber),
-    episode: Number(episodeNumber),
-    title,
-    servers,
-    url,
-  };
+  throw lastError;
 }
 
 /**
@@ -322,13 +283,13 @@ function parseServers($) {
 
   // Método 1: Estilo moderno con #link_url span + .TbVideoNv li (usado en series/capítulos)
   if ($("#link_url span").length > 0) {
-    const generalLanguage = $(".divseason").text().trim() || "Latino";
+    const generalLanguage = cleanText($(".divseason").first().text()) || "Latino";
 
     const serverNamesMap = new Map();
     $(".TbVideoNv li, .VideoPlayer li").each((_, liEl) => {
       const li = $(liEl);
       const id = li.attr("data-id") || li.attr("lid") || "";
-      const name = li.text().trim();
+      const name = cleanText(li.text());
       if (id && name) {
         serverNamesMap.set(id, name);
       }
@@ -337,7 +298,7 @@ function parseServers($) {
     $("#link_url span").each((_, spanEl) => {
       const span = $(spanEl);
       const lid = span.attr("lid") || "";
-      const embedUrl = span.attr("url") || "";
+      const embedUrl = getAbsoluteUrl(span.attr("url") || span.attr("data-url") || "");
       const name = serverNamesMap.get(lid) || "Desconocido";
 
       if (embedUrl) {
@@ -351,7 +312,7 @@ function parseServers($) {
         servers.push({
           name: name,
           server: serverKey,
-          language: generalLanguage,
+          language: cleanText(span.attr("data-name") || span.attr("data-language") || generalLanguage),
           embedUrl: embedUrl,
         });
       }
@@ -359,12 +320,12 @@ function parseServers($) {
   }
 
   // Método 2: Estilo clásico con li.playurl (usado en películas)
-  if (servers.length === 0) {
+  {
     $("li.playurl").each((_, el) => {
       const element = $(el);
-      const embedUrl = element.attr("data-url") || "";
-      const language = element.attr("data-name") || "Subtitulado";
-      const name = element.find("a").text().trim() || element.text().trim() || "Desconocido";
+      const embedUrl = getAbsoluteUrl(element.attr("data-url") || "");
+      const language = cleanText(element.attr("data-name")) || "Subtitulado";
+      const name = cleanText(element.find("a").text() || element.text()) || "Desconocido";
 
       if (embedUrl) {
         let serverKey = name.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -384,7 +345,7 @@ function parseServers($) {
     });
   }
 
-  return servers;
+  return [...new Map(servers.map(server => [`${server.embedUrl}\n${server.language}`, server])).values()];
 }
 
 /**
@@ -396,7 +357,7 @@ async function getGenres() {
   const genres = [];
 
   $("a[href^='/generos/']").each((_, el) => {
-    const text = $(el).text().trim();
+    const text = cleanText($(el).text());
     const slug = $(el).attr("href").split("/").pop();
     if (text && !genres.some((g) => g.slug === slug)) {
       genres.push({ name: text, slug });

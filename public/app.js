@@ -579,7 +579,7 @@ async function setupHeroBanner(item) {
   
   // Fetch details in the background to show rich info
   try {
-    const fullInfo = await apiFetch(`/info/${item.slug}?type=${item.type}&provider=${item.provider || 'pelisplus'}`);
+    const fullInfo = await apiFetch(PeliRequests.info(item));
     if (fullInfo) {
       if (fullInfo.synopsis) {
         heroSynopsis.textContent = fullInfo.synopsis;
@@ -907,7 +907,7 @@ async function loadMediaDetails(item) {
     detailsContent.classList.remove("hidden");
 
     // Fetch full scraping details from backend (auto-aggregation handles providers)
-    const fullInfo = await apiFetch(`/info/${item.slug}?type=${item.type}&provider=${item.provider || ''}`);
+    const fullInfo = await apiFetch(PeliRequests.info(item));
     if (!fullInfo) return;
     state.selectedMedia = fullInfo;
 
@@ -919,8 +919,7 @@ async function loadMediaDetails(item) {
     detailsSynopsis.textContent = fullInfo.synopsis || "Sin sinopsis disponible.";
     
     detailsDirector.textContent = "";
-    const strong = createEl("strong", [], {}, "Director: ");
-    detailsDirector.append(strong, document.createTextNode(fullInfo.directors.join(", ") || "Desconocido"));
+    detailsDirector.textContent = (fullInfo.directors || []).join(", ") || "Desconocido";
 
     // Genres Tags
     detailsGenres.innerHTML = "";
@@ -1008,7 +1007,7 @@ async function fetchEpisodeServers(episode) {
   serversLoading.classList.remove("hidden");
 
   try {
-    const data = await apiFetch(`/servers?slug=${state.selectedMedia.slug}&season=${state.activeSeason}&episode=${episode.number}&provider=${state.selectedMedia.provider || ''}`);
+    const data = await apiFetch(PeliRequests.servers(state.selectedMedia, state.activeSeason, episode.number));
     renderServers(data.servers || [], episode.url);
   } catch (err) {
     const errorDiv = createEl("div", ["downloads-empty"]);
