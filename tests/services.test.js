@@ -189,3 +189,24 @@ test('Cuevana anime episode routes remove anime prefix and support special seaso
   await assert.rejects(api.getEpisodeServers('fine', -1, 1), { statusCode: 400 });
   await assert.rejects(service('cuevana').getContentInfo('missing'), { statusCode: 404 });
 });
+
+test('PelisPlus tries the alternate anime route when a valid page has no servers', async () => {
+  const requests = [];
+  const api = service('pelisplus', { fetchHtml: async url => {
+    requests.push(url);
+    return url.includes('/anime/') ? heading : `${heading}<li class="playurl" data-url="https://video.example/e/real" data-name="Latino"><a>Voe</a></li>`;
+  } });
+  const episode = await api.getEpisodeServers('attack-on-titan', 1, 1, 'anime');
+  assert.equal(requests.length, 2);
+  assert.ok(requests[0].includes('/anime/attack-on-titan/'));
+  assert.ok(requests[1].includes('/serie/attack-on-titan/'));
+  assert.equal(episode.servers.length, 1);
+  assert.equal(episode.servers[0].embedUrl, 'https://video.example/e/real');
+});
+
+test('PelisPlus retains an existing empty episode when neither route exposes servers', async () => {
+  const api = service('pelisplus', { fetchHtml: async () => heading });
+  const episode = await api.getEpisodeServers('empty-anime', 1, 1, 'anime');
+  assert.equal(episode.servers.length, 0);
+  assert.ok(episode.url.includes('/anime/empty-anime/'));
+});

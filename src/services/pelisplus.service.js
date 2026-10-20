@@ -262,6 +262,7 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber, type = 
   if (!['series', 'anime'].includes(type)) throw new ApiError(400, 'El tipo de episodio no es válido');
   const prefixes = type === 'anime' ? ['anime', 'serie'] : ['serie', 'anime'];
   let lastError;
+  let emptyEpisode;
   for (const prefix of prefixes) {
     const url = `${BASE_URL}/${prefix}/${encodedSlug(serieSlug)}/temporada/${seasonNumber}/capitulo/${episodeNumber}`;
     try {
@@ -269,9 +270,14 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber, type = 
       const title = cleanTitle($('h1.m-b-5, .font-size-26.font-weight-bold').first().text());
       const servers = parseServers($);
       if (!title && !servers.length) throw new ApiError(404, 'Episodio no encontrado en PelisPlus');
-      return { serieSlug, season: seasonNumber, episode: episodeNumber, title, servers, url };
+      const result = { serieSlug, season: seasonNumber, episode: episodeNumber, title, servers, url };
+      if (servers.length) return result;
+      // Some anime paths return a valid heading but keep the embeds under /serie/.
+      // Try the other route before declaring that an existing episode has no links.
+      if (!emptyEpisode) emptyEpisode = result;
     } catch (error) { lastError = error; }
   }
+  if (emptyEpisode) return emptyEpisode;
   throw lastError;
 }
 
