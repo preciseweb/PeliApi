@@ -39,15 +39,22 @@ router.get(
 
     let data = [];
     let source = "aggregate";
+    let successfulSearches = 0;
 
     // 1. Buscamos en PelisPlus y RePelisHD en paralelo (ambos son ultraligeros con Cheerio)
     try {
       const [ppData, rpData] = await Promise.all([
-        pelisplusService.searchContent(query).catch(err => {
+        pelisplusService.searchContent(query).then(results => {
+          successfulSearches += 1;
+          return results;
+        }).catch(err => {
           console.error("Error buscando en PelisPlus:", err.message);
           return [];
         }),
-        repelishdService.searchContent(query).catch(err => {
+        repelishdService.searchContent(query).then(results => {
+          successfulSearches += 1;
+          return results;
+        }).catch(err => {
           console.error("Error buscando en RePelisHD:", err.message);
           return [];
         })
@@ -96,11 +103,16 @@ router.get(
     if (data.length === 0) {
       try {
         const cuevanaData = await cuevanaService.searchContent(query);
+        successfulSearches += 1;
         data = (cuevanaData || []).map(item => ({ ...item, provider: "cuevana3" }));
         source = "cuevana3";
       } catch (error) {
         console.error("Error buscando en Cuevana3:", error.message);
       }
+    }
+
+    if (data.length === 0 && successfulSearches === 0) {
+      throw new ApiError(503, "Los proveedores de búsqueda no respondieron. Reintenta en unos minutos.");
     }
 
     res.status(200).json({
