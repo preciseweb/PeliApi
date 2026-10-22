@@ -1,9 +1,9 @@
 const cheerio = require("cheerio");
 const { fetchHtml } = require("../utils/http");
 const { ApiError } = require("../utils/api-error");
-const { cleanText, cleanTitle, absoluteUrl, normalizeSlug, encodedSlug, episodeNumbers, uniqueText } = require("./content.helpers");
+const { cleanText, cleanTitle, absoluteUrl, sourceUrl, serverKey, uniqueServers, normalizeSlug, encodedSlug, episodeNumbers, uniqueText } = require("./content.helpers");
 
-const BASE_URL = process.env.PELISPLUS_DOMAIN || "https://www.pelisplushd.la";
+const BASE_URL = (process.env.PELISPLUS_DOMAIN || "https://www.pelisplushd.la").replace(/\/+$/, '');
 
 /**
  * Normaliza las URLs para que siempre apunten a nuestro dominio o sean absolutas
@@ -31,11 +31,16 @@ function extractSlugFromPath(path) {
   // /pelicula/el-padrino -> "el-padrino"
   // /serie/breaking-bad -> "breaking-bad"
   // /anime/naruto -> "naruto"
-  const url = getAbsoluteUrl(path);
+  const url = sourceUrl(path, BASE_URL);
   if (!url) return '';
   const parts = new URL(url).pathname.split('/').filter(Boolean);
   if (!['pelicula', 'serie', 'anime'].includes(parts[0]) || parts.length !== 2) return '';
   try { return normalizeSlug(parts[1]); } catch { return ''; }
+}
+
+function assertListing($) {
+  if ($('.Posters, a.Posters-link').length || /sin resultados|no se (?:encontraron|han encontrado) resultados/i.test($('body').text())) return;
+  throw new ApiError(503, 'PelisPlus no devolvió una página de catálogo o búsqueda válida');
 }
 
 /**
@@ -50,6 +55,7 @@ async function searchContent(query) {
     const url = `${BASE_URL}/search?s=${encodeURIComponent(searchQuery)}`;
     const html = await fetchHtml(url);
     const $ = cheerio.load(html);
+    assertListing($);
     const results = [];
 
     $("a.Posters-link").each((_, element) => {
@@ -124,6 +130,7 @@ async function getCatalog(type = "movie", genre = "", page = 1) {
   const url = `${BASE_URL}${path}${separator}page=${page}`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
+  assertListing($);
   const items = [];
 
   $("a.Posters-link").each((_, element) => {
@@ -150,7 +157,16 @@ async function getCatalog(type = "movie", genre = "", page = 1) {
   });
 
   // Paginación
-  const hasNextPage = $(".pagination a[rel='next']").length > 0 || $(".pagination .page-item:last-child:not(.disabled) a").length > 0;
+  const hasNextPage = $('.pagination a').toArray().some(element => {
+    const link = $(element);
+    if (link.closest('.disabled, [aria-disabled="true"]').length) return false;
+    const rawHref = link.attr('href') || '';
+    const href = sourceUrl(rawHref, url);
+    if ((link.attr('rel') || '').split(/\s+/).includes('next')) return !rawHref || Boolean(href);
+    if (!href) return false;
+    const target = new URL(href);
+    return target.pathname === new URL(url).pathname && Number(target.searchParams.get('page')) > Number(page);
+  });
 
   return {
     items: [...items.reduce((unique, item) => {
@@ -174,15 +190,20 @@ async function getContentInfo(slug, type = "movie") {
   if (!['movie', 'series', 'anime'].includes(type)) throw new ApiError(400, 'El tipo de contenido no es válido');
   slug = normalizeSlug(slug, { prefixes: ['pelicula', 'serie', 'anime'] });
   const prefixes = type === 'movie' ? ['pelicula'] : type === 'anime' ? ['anime', 'serie'] : ['serie', 'anime'];
-  let url, $, lastError;
+  let url, $, lastError, emptyContent;
   for (const prefix of prefixes) {
     url = `${BASE_URL}/${prefix}/${encodedSlug(slug)}`;
     try {
       $ = cheerio.load(await fetchHtml(url));
-      if ($('h1.m-b-5, .font-size-26.font-weight-bold').first().text().trim()) break;
-      throw new ApiError(404, 'Contenido no encontrado en PelisPlus');
-    } catch (error) { lastError = error; $ = null; }
+      if (!$('h1.m-b-5, .font-size-26.font-weight-bold').first().text().trim()) throw new ApiError(404, 'Contenido no encontrado en PelisPlus');
+      if (type === 'movie' || episodeLinks($, slug).length) break;
+      // A valid anime heading can be a shell: the real season list may live
+      // under /serie/. Keep the shell only if both source routes are empty.
+      if (!emptyContent) emptyContent = { $, url };
+      $ = null;
+    } catch (error) { lastError = error.upstreamStatus === 404 ? new ApiError(404, 'Contenido no encontrado en PelisPlus') : error; $ = null; }
   }
+  if (!$ && emptyContent) ({ $, url } = emptyContent);
   if (!$) throw lastError;
 
   const title = cleanTitle($("h1.m-b-5").first().text() || $(".font-size-26.font-weight-bold").first().text());
@@ -194,7 +215,7 @@ async function getContentInfo(slug, type = "movie") {
   const synopsis = cleanText($(".text-large").first().text() || $("#synopsis").first().text());
   const posterImage = $(".poster img, .movie-poster img, img.img-fluid.m-b-15, img.img-fluid.m-b-30, img.img-fluid.rounded").first();
   const poster = getAbsoluteUrl(posterImage.attr("data-src") || posterImage.attr("src") || $("meta[property=\"og:image\"]").attr("content") || "");
-  const ratingVal = $(".font-size-36.font-weight-bold").text().trim();
+  const ratingVal = cleanText($('.font-size-36.font-weight-bold, .ion-md-star.font-size-18').first().text());
   const rating = ratingVal ? ratingVal : null;
   const yearMatch = $(".font-size-18.text-info").text().trim().match(/\d{4}/);
   const year = yearMatch ? yearMatch[0] : null;
@@ -203,7 +224,7 @@ async function getContentInfo(slug, type = "movie") {
   $("a[href*='/generos/']").each((_, el) => {
     if ($(el).closest('nav, header, footer, .navbar, .dropdown-menu, .nav-item').length) return;
     const text = cleanText($(el).text());
-    const href = getAbsoluteUrl($(el).attr('href') || '');
+    const href = sourceUrl($(el).attr('href') || '', BASE_URL);
     if (!href) return;
     const gSlug = new URL(href).pathname.split('/').filter(Boolean).pop();
     const key = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
@@ -248,25 +269,35 @@ async function getContentInfo(slug, type = "movie") {
     // Las series suelen estructurar temporadas en paneles o listas.
     // Read every episode link, even when .divseason exists without an adjacent ul.
     const seasonsMap = new Map();
-    $("a[href*='/temporada/']").each((_, epLink) => {
-      const epHref = getAbsoluteUrl($(epLink).attr('href') || '');
-      const match = epHref.match(/\/temporada\/(\d+)\/capitulo\/(\d+)(?:[/?#]|$)/i);
-      if (!match) return;
-      const season = Number(match[1]);
-      const number = Number(match[2]);
-      if (number < 1) return;
+    for (const { element: epLink, url: epHref, season, number } of episodeLinks($, slug)) {
       if (!seasonsMap.has(season)) seasonsMap.set(season, new Map());
       const episodes = seasonsMap.get(season);
       if (!episodes.has(number)) episodes.set(number, {
         number, title: cleanText($(epLink).text()) || `Episodio ${number}`, url: epHref, season,
       });
-    });
+    }
     contentInfo.seasons = [...seasonsMap].map(([number, episodes]) => ({
       number, name: `Temporada ${number}`, episodes: [...episodes.values()].sort((a, b) => a.number - b.number),
     })).sort((a, b) => a.number - b.number);
   }
 
   return contentInfo;
+}
+
+function episodeLinks($, slug) {
+  const episodes = [];
+  $("a[href*='/temporada/']").each((_, element) => {
+    const url = sourceUrl($(element).attr('href') || '', BASE_URL);
+    const match = url && new URL(url).pathname.match(/^\/(?:serie|anime)\/([^/]+)\/temporada\/(\d+)\/capitulo\/(\d+)\/?$/i);
+    if (!match) return;
+    let owner;
+    try { owner = normalizeSlug(match[1]); } catch { return; }
+    const season = Number(match[2]);
+    const number = Number(match[3]);
+    if (owner !== slug || !Number.isSafeInteger(season) || !Number.isSafeInteger(number) || number < 1) return;
+    episodes.push({ element, url, season, number });
+  });
+  return episodes;
 }
 
 /**
@@ -291,7 +322,7 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber, type = 
       // Some anime paths return a valid heading but keep the embeds under /serie/.
       // Try the other route before declaring that an existing episode has no links.
       if (!emptyEpisode) emptyEpisode = result;
-    } catch (error) { lastError = error; }
+    } catch (error) { lastError = error.upstreamStatus === 404 ? new ApiError(404, 'Episodio no encontrado en PelisPlus') : error; }
   }
   if (emptyEpisode) return emptyEpisode;
   throw lastError;
@@ -305,7 +336,9 @@ function parseServers($) {
 
   // Método 1: Estilo moderno con #link_url span + .TbVideoNv li (usado en series/capítulos)
   if ($("#link_url span").length > 0) {
-    const generalLanguage = cleanText($(".divseason").first().text()) || "Latino";
+    const languageLabels = uniqueText($('.divseason').toArray().map(element => $(element).text()))
+      .filter(text => /latino|castellano|espa[ñn]ol|subtitulado|doblado|english|japon[eé]s/i.test(text));
+    const generalLanguage = languageLabels.length === 1 ? languageLabels[0] : 'Desconocido';
 
     const serverNamesMap = new Map();
     $(".TbVideoNv li, .VideoPlayer li").each((_, liEl) => {
@@ -324,16 +357,9 @@ function parseServers($) {
       const name = serverNamesMap.get(lid) || "Desconocido";
 
       if (embedUrl) {
-        let serverKey = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-        if (serverKey.includes("streamwish") || embedUrl.includes("streamwish")) serverKey = "streamwish";
-        else if (serverKey.includes("voesx") || serverKey.includes("voe") || embedUrl.includes("voe.sx")) serverKey = "voesx";
-        else if (serverKey.includes("streamtape") || embedUrl.includes("streamtape")) serverKey = "streamtape";
-        else if (serverKey.includes("netu") || serverKey.includes("hqq") || embedUrl.includes("hqq") || embedUrl.includes("waaw") || embedUrl.includes("netu")) serverKey = "netu";
-        else if (serverKey.includes("vidhide") || embedUrl.includes("vidhide")) serverKey = "vidhide";
-
         servers.push({
           name: name,
-          server: serverKey,
+          server: serverKey(name, embedUrl),
           language: cleanText(span.attr("data-name") || span.attr("data-language") || generalLanguage),
           embedUrl: embedUrl,
         });
@@ -346,20 +372,13 @@ function parseServers($) {
     $("li.playurl").each((_, el) => {
       const element = $(el);
       const embedUrl = getAbsoluteUrl(element.attr("data-url") || "");
-      const language = cleanText(element.attr("data-name")) || "Subtitulado";
+      const language = cleanText(element.attr('data-name') || element.attr('data-language')) || 'Desconocido';
       const name = cleanText(element.find("a").text() || element.text()) || "Desconocido";
 
       if (embedUrl) {
-        let serverKey = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-        if (serverKey.includes("streamwish") || embedUrl.includes("streamwish")) serverKey = "streamwish";
-        else if (serverKey.includes("voesx") || serverKey.includes("voe") || embedUrl.includes("voe.sx")) serverKey = "voesx";
-        else if (serverKey.includes("streamtape") || embedUrl.includes("streamtape")) serverKey = "streamtape";
-        else if (serverKey.includes("netu") || serverKey.includes("hqq") || embedUrl.includes("hqq") || embedUrl.includes("waaw") || embedUrl.includes("netu")) serverKey = "netu";
-        else if (serverKey.includes("vidhide") || embedUrl.includes("vidhide")) serverKey = "vidhide";
-
         servers.push({
           name: name,
-          server: serverKey,
+          server: serverKey(name, embedUrl),
           language: language,
           embedUrl: embedUrl,
         });
@@ -367,7 +386,7 @@ function parseServers($) {
     });
   }
 
-  return [...new Map(servers.map(server => [`${server.embedUrl}\n${server.language}`, server])).values()];
+  return uniqueServers(servers);
 }
 
 /**
@@ -378,9 +397,13 @@ async function getGenres() {
   const $ = cheerio.load(html);
   const genres = [];
 
-  $("a[href^='/generos/']").each((_, el) => {
+  $("a[href*='/generos/']").each((_, el) => {
     const text = cleanText($(el).text());
-    const slug = $(el).attr("href").split("/").pop();
+    const url = sourceUrl($(el).attr('href'), BASE_URL);
+    const path = url && new URL(url).pathname.match(/^\/generos\/([^/]+)\/?$/);
+    if (!path) return;
+    let slug;
+    try { slug = normalizeSlug(path[1]); } catch { return; }
     if (text && !genres.some((g) => g.slug === slug)) {
       genres.push({ name: text, slug });
     }

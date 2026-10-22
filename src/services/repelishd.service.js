@@ -1,10 +1,11 @@
 const cheerio = require("cheerio");
 const { fetchHtml, decodeHtmlBuffer } = require("../utils/http");
-const { cleanText, cleanTitle, absoluteUrl, normalizeSlug, encodedSlug, episodeNumbers } = require("./content.helpers");
+const { cleanText, cleanTitle, absoluteUrl, sourceUrl, serverKey, uniqueServers, normalizeSlug, encodedSlug, episodeNumbers } = require("./content.helpers");
 const { ApiError } = require("../utils/api-error");
+const { getContentSignal } = require('../utils/content-cache');
 const axios = require("axios");
 
-const BASE_URL = process.env.REPELISHD_DOMAIN || "https://repelishd.ceo";
+const BASE_URL = (process.env.REPELISHD_DOMAIN || "https://repelishd.ceo").replace(/\/+$/, '');
 
 /**
  * Normaliza las URLs para que siempre sean absolutas
@@ -17,16 +18,18 @@ function getAbsoluteUrl(path) {
  * Busca películas en RePelisHD usando la consulta POST de DLE
  */
 async function searchContent(query) {
-  if (!query) {
+  if (typeof query !== 'string' || !query.trim()) {
     throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
   }
 
+  query = query.trim();
   const url = `${BASE_URL}/index.php?do=search`;
   const postData = `do=search&subaction=search&story=${encodeURIComponent(query)}`;
 
   try {
     const response = await axios.post(url, postData, {
       timeout: 15000,
+      signal: getContentSignal(),
       responseType: "arraybuffer",
       transformResponse: [],
       headers: {
@@ -38,6 +41,7 @@ async function searchContent(query) {
     });
 
     const $ = cheerio.load(decodeHtmlBuffer(response.data, response.headers?.["content-type"]));
+    if (!$('#dle-content').length) throw new ApiError(503, 'RePelisHD no devolvió una página de búsqueda válida');
     const results = [];
 
     // En DLE, los resultados de búsqueda están contenidos dentro de div#dle-content
@@ -47,7 +51,7 @@ async function searchContent(query) {
       const posterLink = posterDiv.find("a");
       const href = posterLink.attr("href") || "";
       const img = posterDiv.find("img");
-      const poster = getAbsoluteUrl(img.attr("src") || img.attr("data-src") || "");
+      const poster = getAbsoluteUrl(img.attr("data-src") || img.attr("src") || "");
       
       const titleLink = el.find(".data h3 a");
       const title = cleanTitle(titleLink.text());
@@ -58,7 +62,7 @@ async function searchContent(query) {
       const yearText = el.find(".data span, .poster span").text().trim();
       const year = yearText.match(/(?:18|19|20|21)\d{2}/)?.[0] || null;
 
-      const path = getAbsoluteUrl(href);
+      const path = sourceUrl(href, BASE_URL);
       const match = path && new URL(path).pathname.match(/^\/ver-pelicula\/([^/]+)\.html\/?$/);
       let slug = "";
       try { if (match) slug = normalizeSlug(match[1]); } catch {}
@@ -90,7 +94,12 @@ async function searchContent(query) {
     return uniqueResults;
   } catch (error) {
     console.error("Error in RePelisHD searchContent:", error.message);
-    return [];
+    const signal = getContentSignal();
+    if (signal?.aborted) throw signal.reason;
+    // A failed source is different from a legitimate search with zero results.
+    // Preserve the failure so aggregation can report an outage accurately.
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(503, 'RePelisHD no respondió a la búsqueda', error.message);
   }
 }
 
@@ -103,7 +112,7 @@ async function getContentInfo(slug, type = "movie") {
   }
 
   if (type !== "movie") throw new ApiError(404, "RePelisHD no ofrece episodios de series o anime");
-  slug = normalizeSlug(slug.replace(/\.html$/, ""), { prefixes: ["ver-pelicula"] });
+  slug = normalizeSlug(typeof slug === 'string' ? slug.replace(/\.html\/?$/, '') : slug, { prefixes: ["ver-pelicula"] });
   const path = `/ver-pelicula/${encodedSlug(slug)}.html`;
   const url = `${BASE_URL}${path}`;
   
@@ -116,7 +125,7 @@ async function getContentInfo(slug, type = "movie") {
   }
 
   const synopsis = cleanText($(".description p").text() || $(".description").first().text());
-  const poster = getAbsoluteUrl($(".poster img").first().attr("src") || $(".poster img").first().attr("data-src") || "");
+  const poster = getAbsoluteUrl($(".poster img").first().attr("data-src") || $(".poster img").first().attr("src") || "");
 
   let year = null;
   const yearMatch = ($("meta[property=\"video:release_date\"]").attr("content") || $(".meta, .info, time").text()).match(/(?:18|19|20|21)\d{2}/);
@@ -128,8 +137,11 @@ async function getContentInfo(slug, type = "movie") {
   $('a[href*="/genero/"]').each((_, el) => {
     if ($(el).closest("nav, header, footer, .navbar, .menu, .dropdown-menu").length) return;
     const text = cleanText($(el).text());
-    const href = $(el).attr("href") || "";
-    const gSlug = href.split("/genero/").pop().replace(/\//g, "");
+    const href = sourceUrl($(el).attr('href') || '', BASE_URL);
+    const path = href && new URL(href).pathname.match(/^\/genero\/([^/]+)\/?$/);
+    if (!path) return;
+    let gSlug;
+    try { gSlug = normalizeSlug(path[1]); } catch { return; }
     if (text && !genres.some(g => g.name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase() === text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase())) {
       genres.push({ name: text, slug: gSlug });
     }
@@ -154,7 +166,8 @@ async function getContentInfo(slug, type = "movie") {
   const servers = [];
   
   // Buscar iframe del resolver en la página de RePelisHD
-  const iframeSrc = getAbsoluteUrl($("iframe").first().attr("data-src") || $("iframe").first().attr("src") || "");
+  const iframeSrc = $('iframe').toArray().map(element => getAbsoluteUrl($(element).attr('data-src') || $(element).attr('src') || ''))
+    .find(src => src && /(^|\.)verhdlink\.cam$/i.test(new URL(src).hostname)) || '';
   if (iframeSrc && /(^|\.)verhdlink\.cam$/i.test(new URL(iframeSrc).hostname)) {
     try {
       // Cargar el player resolver enviando cabecera Referer
@@ -182,29 +195,29 @@ async function getContentInfo(slug, type = "movie") {
             }
 
             // Identificar clave del servidor y nombre descriptivo
-            let serverKey = "unknown";
+            let key = serverKey(text, embedUrl);
             let serverName = "Directo";
 
             if (text.includes("dropload") || embedUrl.includes("dr0pstream") || embedUrl.includes("dropload")) {
-              serverKey = "dropload";
+              key = "dropload";
               serverName = "Dropload";
             } else if (text.includes("mixdrop") || embedUrl.includes("mixdrop")) {
-              serverKey = "mixdrop";
+              key = "mixdrop";
               serverName = "Mixdrop";
             } else if (text.includes("doodstream") || text.includes("dood") || embedUrl.includes("dood")) {
-              serverKey = "doodstream";
+              key = "doodstream";
               serverName = "Doodstream";
             } else if (text.includes("streamwish") || embedUrl.includes("streamwish")) {
-              serverKey = "streamwish";
+              key = "streamwish";
               serverName = "Streamwish";
             } else if (text.includes("fullhd") || text.includes("4k") || text.includes("server 4k")) {
-              serverKey = "server4k";
+              key = "server4k";
               serverName = "Server 4K";
             }
 
             servers.push({
-              name: serverName,
-              server: serverKey,
+              name: serverName === 'Directo' ? cleanText(mirror.text()) || 'Desconocido' : serverName,
+              server: key,
               language: lang.label,
               embedUrl,
             });
@@ -213,10 +226,14 @@ async function getContentInfo(slug, type = "movie") {
       }
     } catch (err) {
       console.error("Error fetching player mirrors from verhdlink resolver:", err.message);
+      // Metadata without its mirrors used to look like a successful playable
+      // result. Keep the resolver failure visible so clients can retry/select.
+      if (err instanceof ApiError) throw err;
+      throw new ApiError(503, 'No se pudieron obtener los servidores de RePelisHD', err.message);
     }
   }
 
-  contentInfo.servers = [...new Map(servers.map(server => [`${server.embedUrl}\n${server.language}`, server])).values()];
+  contentInfo.servers = uniqueServers(servers);
   return contentInfo;
 }
 

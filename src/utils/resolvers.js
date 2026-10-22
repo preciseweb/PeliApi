@@ -9,7 +9,7 @@ const {
 } = require("./http");
 
 // Shared browser instance
-const { getBrowser } = require("./browser");
+const { withPage } = require("./browser");
 
 // yt-dlp high-speed resolver
 const ytdlpResolver = require("./resolvers/ytdlp.resolver");
@@ -46,131 +46,133 @@ function getRefererForUrl(url) {
 async function resolveEmbedWithPuppeteer(url, referer) {
   debugLog("Puppeteer", "Resolving URL", url);
   try {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
+    return await withPage(async (page) => {
+      await page.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      );
 
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    );
-
-    if (referer) {
-      await page.setExtraHTTPHeaders({ Referer: referer });
-    }
-
-    // 1. Activar interceptación de peticiones de red
-    await page.setRequestInterception(true);
-
-    let interceptedUrl = null;
-    page.on("request", (req) => {
-      const rUrl = req.url();
-      const type = req.resourceType();
-      
-      // Capturar la URL del stream de video objetivo
-      const isMedia = /\.(?:m3u8|mp4)(?:\?|#|$)/i.test(rUrl);
-      if (
-        !interceptedUrl &&
-        type !== "document" &&
-        isMedia &&
-        !rUrl.startsWith("blob:") &&
-        !rUrl.includes("blank")
-      ) {
-        interceptedUrl = rUrl;
+      if (referer) {
+        await page.setExtraHTTPHeaders({ Referer: referer });
       }
 
-      // 2. Bloquear elementos pesados que no aportan a la extracción
-      const blockTypes = ["image", "stylesheet", "font"];
-      if (blockTypes.includes(type)) {
-        req.abort();
-        return;
-      }
+      // 1. Activar interceptación de peticiones de red
+      await page.setRequestInterception(true);
 
-      // 3. Bloquear dominios y scripts de redes de publicidad invasivas
-      const isAd = /(google-analytics|doubleclick|adsterra|exoclick|popads|propellerads|clickadu|popcash|adnxs|mgid|outbrain|taboola|histats|amung|jads|ero-advertising|realsrv|admaven|coinhive|monetize|track|adshost|adsrv|a.bestcontent|a.shorte)/i.test(rUrl);
-      if (isAd || (type === "script" && !rUrl.includes("player") && !rUrl.includes("video") && !rUrl.includes("jwplatform") && !rUrl.includes("plyr"))) {
-        req.abort();
-        return;
-      }
-
-      req.continue();
-    });
-
-    // Wait for page to load
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
-
-    // Attempt to click play buttons to trigger video load
-    try {
-      const playBtnSelectors =
-        ".play-button, button, .vjs-big-play-button, [role='button'], .jw-icon-display, .plyr__control--overlaid";
-      const playBtn = await page.$(playBtnSelectors);
-      if (playBtn) await playBtn.click();
-    } catch (e) {}
-
-    // Wait for potential JS to execute and requests to fire
-    await new Promise((r) => setTimeout(r, 4000));
-
-    // Try clicking inside iframes (common in SPAs like new Filemoon)
-    if (!interceptedUrl) {
-      for (const frame of page.frames()) {
+      let interceptedUrl = null;
+      page.on("request", (req) => {
         try {
-          const playBtn = await frame.$(
-            ".play-button, button, .vjs-big-play-button, [role='button'], .jw-icon-display, .plyr__control--overlaid"
-          );
-          if (playBtn) await playBtn.click();
-        } catch (e) {}
+          const rUrl = req.url();
+          const type = req.resourceType();
+      
+          // Capturar la URL del stream de video objetivo
+          const isMedia = /\.(?:m3u8|mp4)(?:\?|#|$)/i.test(rUrl);
+          if (
+            !interceptedUrl &&
+            type !== "document" &&
+            isMedia &&
+            !rUrl.startsWith("blob:") &&
+            !rUrl.includes("blank")
+          ) {
+            interceptedUrl = rUrl;
+            // Resolving metadata must not download the video into the API process.
+            void req.abort().catch(() => {});
+            return;
+          }
+
+          // 2. Bloquear elementos pesados que no aportan a la extracción
+          const blockTypes = ["image", "stylesheet", "font"];
+          if (blockTypes.includes(type)) {
+            void req.abort().catch(() => {});
+            return;
+          }
+
+          // 3. Bloquear dominios y scripts de redes de publicidad invasivas
+          const isAd = /(google-analytics|doubleclick|adsterra|exoclick|popads|propellerads|clickadu|popcash|adnxs|mgid|outbrain|taboola|histats|amung|jads|ero-advertising|realsrv|admaven|coinhive|monetize|track|adshost|adsrv|a.bestcontent|a.shorte)/i.test(rUrl);
+          if (isAd || (type === "script" && !rUrl.includes("player") && !rUrl.includes("video") && !rUrl.includes("jwplatform") && !rUrl.includes("plyr"))) {
+            void req.abort().catch(() => {});
+            return;
+          }
+
+          void req.continue().catch(() => {});
+        } catch (_error) { /* The controlled page may close during interception. */ }
+      });
+
+      // Wait for page to load
+      await page.goto(url, { waitUntil: "networkidle2", timeout: 15000 });
+
+      // Attempt to click play buttons to trigger video load
+      try {
+        const playBtnSelectors =
+          ".play-button, button, .vjs-big-play-button, [role='button'], .jw-icon-display, .plyr__control--overlaid";
+        const playBtn = await page.$(playBtnSelectors);
+        if (playBtn) await playBtn.click();
+      } catch (e) {}
+
+      // Wait for potential JS to execute and requests to fire
+      await new Promise((r) => setTimeout(r, 4000));
+
+      // Try clicking inside iframes (common in SPAs like new Filemoon)
+      if (!interceptedUrl) {
+        for (const frame of page.frames()) {
+          try {
+            const playBtn = await frame.$(
+              ".play-button, button, .vjs-big-play-button, [role='button'], .jw-icon-display, .plyr__control--overlaid"
+            );
+            if (playBtn) await playBtn.click();
+          } catch (e) {}
+        }
+        await new Promise((r) => setTimeout(r, 3000));
       }
-      await new Promise((r) => setTimeout(r, 3000));
-    }
 
-    if (interceptedUrl) {
-      debugLog("Puppeteer", "Intercepted media URL", interceptedUrl);
-      await page.close();
-      return interceptedUrl;
-    }
-
-    const html = await page.content();
-    await page.close();
-
-    debugLog("Puppeteer", "Fetched HTML length", html.length);
-
-    const $ = cheerio.load(html);
-
-    // Try many patterns
-    const patterns = [
-      /sources?\s*:\s*\[\s*\{[^}]*(?:file|src)\s*:\s*['"]([^'"]+)['"]/i,
-      /"file"\s*:\s*"([^"]+)"/i,
-      /"source"\s*:\s*"([^"]+)"/i,
-      /"video"\s*:\s*"([^"]+)"/i,
-      /(https?:\/\/[^\s"'>]+\.(?:mp4|m3u8)[^\s"'>]*)/i,
-      /video\s*src\s*=\s*["']([^"']+)["']/i,
-      /source\s+src\s*=\s*["']([^"']+)["']/i,
-      /data-src\s*=\s*["']([^"']+)["']/i,
-    ];
-
-    for (const pattern of patterns) {
-      const match = html.match(pattern);
-      if (match && match[1] && isLikelyVideoUrl(match[1])) {
-        debugLog("Puppeteer", "Found URL", match[1]);
-        return match[1];
+      if (interceptedUrl) {
+        debugLog("Puppeteer", "Intercepted media URL", interceptedUrl);
+        return interceptedUrl;
       }
-    }
 
-    // Try video element
-    const videoSrc = $("video").attr("src");
-    if (videoSrc && isLikelyVideoUrl(videoSrc)) {
-      return videoSrc;
-    }
+      const html = await page.content();
 
-    // Try data attributes
-    const dataElements = $("[data-src], [data-source], [data-video], [data-file]");
-    for (let i = 0; i < dataElements.length; i++) {
-      const dataSrc =
-        $(dataElements[i]).attr("data-src") || $(dataElements[i]).attr("data-source");
-      if (dataSrc && isLikelyVideoUrl(dataSrc)) {
-        return dataSrc;
+      debugLog("Puppeteer", "Fetched HTML length", html.length);
+
+      const $ = cheerio.load(html);
+
+      // Try many patterns
+      const patterns = [
+        /sources?\s*:\s*\[\s*\{[^}]*(?:file|src)\s*:\s*['"]([^'"]+)['"]/i,
+        /"file"\s*:\s*"([^"]+)"/i,
+        /"source"\s*:\s*"([^"]+)"/i,
+        /"video"\s*:\s*"([^"]+)"/i,
+        /(https?:\/\/[^\s"'>]+\.(?:mp4|m3u8)[^\s"'>]*)/i,
+        /video\s*src\s*=\s*["']([^"']+)["']/i,
+        /source\s+src\s*=\s*["']([^"']+)["']/i,
+        /data-src\s*=\s*["']([^"']+)["']/i,
+      ];
+
+      for (const pattern of patterns) {
+        const match = html.match(pattern);
+        if (match && match[1] && isLikelyVideoUrl(match[1])) {
+          debugLog("Puppeteer", "Found URL", match[1]);
+          return match[1];
+        }
       }
-    }
 
-    return null;
+      // Try video element
+      const videoSrc = $("video").attr("src");
+      if (videoSrc && isLikelyVideoUrl(videoSrc)) {
+        return videoSrc;
+      }
+
+      // Try data attributes
+      const dataElements = $("[data-src], [data-source], [data-video], [data-file]");
+      for (let i = 0; i < dataElements.length; i++) {
+        const dataSrc =
+          $(dataElements[i]).attr("data-src") || $(dataElements[i]).attr("data-source");
+        if (dataSrc && isLikelyVideoUrl(dataSrc)) {
+          return dataSrc;
+        }
+      }
+
+      return null;
+    });
   } catch (err) {
     debugLog("Puppeteer", "Error", err.message);
     return null;
@@ -287,55 +289,6 @@ async function resolveDoodstreamUrl(url, referer) {
         const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         let randomStr = "";
         for (let i = 0; i < 10; i++) {
-          randomStr += chars.charAt(Mock.floor(Math.random() * chars.length) || 0); // Math.floor (typo fix: Math instead of Mock if needed, but let's check)
-        }
-        // Let's use Math.floor
-        const directUrl = `${tokenUrl}${randomStr}?token=${passMatch[0].split("/").pop()}&expiry=${Date.now()}`;
-        debugLog("Doodstream", "Constructed direct URL", directUrl);
-        return directUrl;
-      }
-    }
-
-    const extracted = findFirstUrl(html, [
-      /(https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*)/i,
-      /(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i,
-      /"file"\s*:\s*"([^"]+)"/i,
-      /source\s*src\s*=\s*["']([^"']+)["']/i,
-    ]);
-
-    if (extracted) {
-      debugLog("Doodstream", "Found fallback URL", extracted);
-      return extracted;
-    }
-
-    debugLog("Doodstream", "No URL found");
-    return null;
-  } catch (err) {
-    debugLog("Doodstream", "Error", err.message);
-    return null;
-  }
-}
-
-// Typo fix: we will use Math.floor in resolveDoodstreamUrl below
-async function resolveDoodstreamUrl(url, referer) {
-  debugLog("Doodstream", "Resolving URL", url);
-  try {
-    let embedUrl = url.replace(/\/d\//, "/e/");
-    const { html } = await fetchHtmlWithHeaders(embedUrl, referer);
-    debugLog("Doodstream", "Fetched HTML length", html.length);
-
-    const passMatch = html.match(/\/pass_md5\/[^'"\s]+/i);
-    if (passMatch) {
-      const passUrl = `https://${new URL(embedUrl).hostname}${passMatch[0]}`;
-      debugLog("Doodstream", "Fetching pass_md5 token", passUrl);
-
-      const tokenResponse = await fetchHtmlWithHeaders(passUrl, embedUrl);
-      const tokenUrl = tokenResponse.html.trim();
-
-      if (tokenUrl && (tokenUrl.startsWith("http") || tokenUrl.startsWith("//"))) {
-        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        let randomStr = "";
-        for (let i = 0; i < 10; i++) {
           randomStr += chars.charAt(Math.floor(Math.random() * chars.length));
         }
         const expiry = Date.now();
@@ -413,6 +366,9 @@ async function resolveEmbedUrl(url, parentUrl = null) {
     return url;
   }
 
+  if (!/^https?:$/.test(parsed.protocol)) return null;
+  if (/\.(?:mp4|m3u8|mkv|webm|avi|mov)$/i.test(parsed.pathname)) return url;
+
   const host = parsed.hostname.replace(/^www\./, "").toLowerCase();
   const pathname = parsed.pathname.toLowerCase();
   const referer = getRefererForUrl(parentUrl || url);
@@ -481,14 +437,8 @@ async function resolveEmbedUrl(url, parentUrl = null) {
     if (ytdlpResolved) return ytdlpResolved;
   }
 
-  // 3. Puppeteer Protected Fallback
-  const isProtectedSite = /wish|playnix|medix|niramirus|kravaxxa|davioad|haxlopp|tryzendm|dumbalag|dhcplay|hglink|vidhide|voe|mixdrop|dood|dropload/i.test(host);
-  if (isProtectedSite) {
-    debugLog("resolveEmbed", "Using Puppeteer for protected site", null);
-    const resolved = await resolveEmbedWithPuppeteer(url, referer);
-    if (resolved) return resolved;
-  }
-
+  // 3. Try the shared browser fallback once, including protected embeds.
+  // Repeating a failed browser attempt doubles latency and browser resource use.
   // Fallback: try Puppeteer for any embed
   debugLog("resolveEmbed", "Trying Puppeteer fallback", null);
   const puppeteerResolved = await resolveEmbedWithPuppeteer(url, referer);

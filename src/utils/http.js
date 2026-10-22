@@ -1,7 +1,10 @@
 const axios = require("axios");
+const http = require("node:http");
+const https = require("node:https");
 const { URL } = require("node:url");
 const { TextDecoder } = require("node:util");
 const { ApiError } = require("./api-error");
+const { getContentSignal } = require("./content-cache");
 
 const DEFAULT_HEADERS = {
   "User-Agent":
@@ -83,44 +86,76 @@ function decodeHtmlBuffer(value, contentType = "") {
   return decodeUtf8OrLegacy(bytes);
 }
 
-async function fetchHtml(url, customHeaders = {}) {
+// Reuse upstream connections without allowing a stalled source to consume an
+// unbounded number of sockets. No response cache is kept here: signed embeds
+// and pages fetched with different headers must never share transport results.
+const agentOptions = {
+  keepAlive: true,
+  maxSockets: 8,
+  maxTotalSockets: 32,
+  maxFreeSockets: 4,
+  timeout: 30000,
+};
+const httpAgent = new http.Agent(agentOptions);
+const httpsAgent = new https.Agent(agentOptions);
+
+function requestLimit(value, fallback, maximum) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.min(Math.floor(parsed), maximum) : fallback;
+}
+
+async function requestHtml(url, headers) {
+  const timeout = requestLimit(process.env.REQUEST_TIMEOUT_MS, 15000, 25000);
+  const maxBytes = requestLimit(process.env.MAX_HTML_BYTES, 8 * 1024 * 1024, 32 * 1024 * 1024);
+  // Axios' socket timeout alone does not bound a response that keeps sending
+  // bytes or redirects. The signal limits the complete upstream transaction.
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const contentSignal = getContentSignal();
+  const abortContent = () => controller.abort(contentSignal.reason);
+  if (contentSignal?.aborted) abortContent();
+  else contentSignal?.addEventListener("abort", abortContent, { once: true });
+  const deadline = setTimeout(() => controller.abort(), timeout);
+  deadline.unref?.();
   try {
-    const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
     const response = await axios.get(url, {
       timeout,
-      headers: { ...HTML_HEADERS, ...customHeaders },
+      signal,
+      headers,
+      httpAgent,
+      httpsAgent,
       responseType: "arraybuffer",
       transformResponse: [],
+      maxContentLength: maxBytes,
+      maxBodyLength: maxBytes,
       maxRedirects: 5,
-      validateStatus: (status) => status >= 200 && status < 400,
+      validateStatus: (status) => status >= 200 && status < 300,
     });
-    return decodeHtmlBuffer(response.data, response.headers?.["content-type"]);
+    return { html: decodeHtmlBuffer(response.data, response.headers?.["content-type"]), headers: response.headers };
   } catch (error) {
-    throw new ApiError(500, `No se pudo obtener el contenido desde ${url}`, error.message);
+    const timedOut = signal.aborted || error.code === "ECONNABORTED" || error.code === "ETIMEDOUT";
+    const failure = new ApiError(timedOut ? 504 : 502,
+      timedOut ? "El proveedor no respondió a tiempo" : "No se pudo obtener el contenido del proveedor",
+      error.message);
+    // Provider adapters may distinguish an anti-bot response from transport
+    // failure without exposing upstream URLs or credentials in public errors.
+    failure.upstreamStatus = error.response?.status;
+    throw failure;
+  } finally {
+    clearTimeout(deadline);
+    contentSignal?.removeEventListener("abort", abortContent);
   }
 }
 
+async function fetchHtml(url, customHeaders = {}) {
+  const response = await requestHtml(url, { ...HTML_HEADERS, ...customHeaders });
+  return response.html;
+}
+
 async function fetchHtmlWithHeaders(url, referer, customHeaders = {}) {
-  try {
-    const timeout = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
-    const headers = { ...HTML_HEADERS, ...customHeaders };
-    if (referer) {
-      headers.Referer = referer;
-    }
-
-    const response = await axios.get(url, {
-      timeout,
-      headers,
-      responseType: "arraybuffer",
-      transformResponse: [],
-      maxRedirects: 5,
-      validateStatus: (status) => status >= 200 && status < 400,
-    });
-
-    return { html: decodeHtmlBuffer(response.data, response.headers?.["content-type"]), headers: response.headers };
-  } catch (error) {
-    throw new ApiError(500, `Error de red al consultar ${url}`, error.message);
-  }
+  const headers = { ...HTML_HEADERS, ...customHeaders };
+  if (referer) headers.Referer = referer;
+  return requestHtml(url, headers);
 }
 
 function resolveAbsoluteUrl(base, relative) {

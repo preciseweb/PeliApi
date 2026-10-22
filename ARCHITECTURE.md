@@ -92,7 +92,7 @@ Encargada de leer y procesar la información de portales externos en tiempo real
     *   **Decodificación Nativa (VOE / Streamwish)**: Decodifica de forma síncrona mediante JavaScript puro y peticiones HTTP (`axios` + `unpacker` en local), evitando la sobrecarga de Puppeteer.
     *   **Puppeteer (Headless Chrome)**: Navegador Chromium controlado mediante código. Se usa únicamente como último recurso cuando la página externa requiere resolver desafíos JavaScript complejos, capturar llamadas de red dinámicas en iframe o ejecutar reproductores protegidos.
 *   **¿Dónde y cómo se usa?**:
-    *   `src/services/pelisplus.service.js`: Utiliza **Axios + Cheerio** para parsear el catálogo principal, categorías y listas de servidores desde PelisPlus de manera síncrona en milisegundos.
+    *   `src/services/pelisplus.service.js`: Utiliza **Axios + Cheerio** para parsear el catálogo principal, categorías y listas de servidores desde PelisPlus, con validación de la estructura recibida.
     *   `src/utils/resolvers.js` y `src/utils/resolvers/`: Orquesta la extracción de enlaces directos delegando en resolvedores específicos de dominio (`voe.resolver.js`, `streamwish.resolver.js`, `streamtape.resolver.js`) y `yt-dlp`. Si estos fallan o se detectan scripts altamente protegidos, ejecuta de forma controlada **Puppeteer** (con limitación de concurrencia y limpieza de procesos zombies en `browser.js`) para capturar el stream `.m3u8` o `.mp4` final.
 
 ---
@@ -136,3 +136,11 @@ Gestor de colas y procesamiento que permite almacenar los vídeos en local de ma
                                            ▼
                            [Notificación en Cliente (Toast)]
 ```
+
+## Revisión de consistencia y recursos
+
+Las fuentes consultan HTML primero; Cuevana usa navegador cuando el documento necesita renderizado. Los identificadores de proveedor se conservan durante información y episodios. Los adaptadores vinculan episodios al título y servidores a sus pestañas.
+
+`content-cache.js` comparte lecturas y propaga cancelación mediante `AsyncLocalStorage`. HTTP reutiliza conexiones con límites de sockets y tamaño de documento. `browser.js` mantiene un lanzamiento compartido, páginas y cola acotadas, y cierra las páginas ante errores o plazos agotados.
+
+Las descargas usan una cola FIFO con concurrencia y capacidad configurables. Su historial terminal tiene límite y caducidad de metadatos. El cierre del servidor o CLI cancela streams y FFmpeg, elimina parciales y conserva archivos completos. Los módulos reutilizables se importan sin abrir puertos ni terminar el proceso.

@@ -25,6 +25,21 @@ const state = {
 };
 
 const API_BASE = "/api/v1/content";
+let detailsRevision = 0;
+let episodeRevision = 0;
+let resultsRevision = 0;
+let heroRevision = 0;
+let paginationCheckPending = false;
+let resultsRetryButton = null;
+
+function stopEmbeddedPlayback() {
+  // A fresh browsing context releases the previous host's scripts and listeners.
+  const nextFrame = playerIframe.cloneNode(false);
+  nextFrame.src = 'about:blank';
+  playerIframe.parentNode.replaceChild(nextFrame, playerIframe);
+  playerIframe = nextFrame;
+  videoPlayerContainer.classList.add('hidden');
+}
 
 // DOM Elements
 const searchForm = document.getElementById("search-form");
@@ -56,7 +71,7 @@ const serversLoading = document.getElementById("servers-loading");
 const serversContainer = document.getElementById("servers-container");
 
 const videoPlayerContainer = document.getElementById("video-player-container");
-const playerIframe = document.getElementById("player-iframe");
+let playerIframe = document.getElementById("player-iframe");
 const playerTitle = document.getElementById("player-title");
 const closePlayerBtn = document.getElementById("close-player-btn");
 
@@ -92,6 +107,10 @@ window.addEventListener("scroll", () => {
 
 // SPA View Navigation Functions
 function showHomeView() {
+  resultsRevision++;
+  state.hasNextPage = false;
+  state.isLoadingMore = false;
+  showResultsLoading(false);
   homeView.classList.remove("hidden");
   gridView.classList.add("hidden");
   
@@ -117,10 +136,13 @@ function toggleDownloadsDrawer() {
 
 // Close Immersive Overlay Details Modal
 function closeDetailsModal() {
+  detailsRevision++;
+  episodeRevision++;
+  state.selectedMedia = null;
   detailsPanel.classList.add("hidden");
   // Instantly cut video playback source and hide video player wrapper
-  playerIframe.src = "";
-  videoPlayerContainer.classList.add("hidden");
+  stopEmbeddedPlayback();
+  serversLoading.classList.add('hidden');
 }
 
 // Event Listeners Configuration
@@ -237,50 +259,41 @@ function setupEventListeners() {
 
   // Close video player
   closePlayerBtn.addEventListener("click", () => {
-    videoPlayerContainer.classList.add("hidden");
-    playerIframe.src = "";
+    stopEmbeddedPlayback();
   });
 }
 
 const abortControllers = new Map();
 
-// Fetch helper with AbortController to cancel redundant identical requests
+// Share identical in-flight GETs without letting the hero cancel a details request.
+// View revisions below decide whether a response still belongs to the visible UI.
 async function apiFetch(endpoint, options = {}) {
-  const key = endpoint;
-  if (abortControllers.has(key)) {
-    abortControllers.get(key).abort();
-  }
+  const method = (options.method || 'GET').toUpperCase();
+  const key = method === 'GET' ? endpoint : Symbol(endpoint);
+  const existing = abortControllers.get(key);
+  if (existing) return existing.promise;
 
   const controller = new AbortController();
-  abortControllers.set(key, controller);
-
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    };
-
-    const url = endpoint === "/health" ? "/health" : `${API_BASE}${endpoint}`;
-    const response = await fetch(url, {
-      ...options,
-      headers,
-      signal: controller.signal
-    });
-
-    const json = await response.json();
-    if (!response.ok || !json.success) {
-      throw new Error(json.message || `API Error: ${response.status}`);
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  const entry = { controller, promise: null };
+  abortControllers.set(key, entry);
+  entry.promise = (async () => {
+    try {
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      const url = endpoint === '/health' ? '/health' : `${API_BASE}${endpoint}`;
+      const response = await fetch(url, { ...options, headers, signal: controller.signal });
+      const json = await response.json();
+      if (!response.ok || !json.success) throw new Error(json.message || `API Error: ${response.status}`);
+      return json.data;
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error('La solicitud tardó demasiado. Intenta de nuevo.');
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+      if (abortControllers.get(key) === entry) abortControllers.delete(key);
     }
-
-    return json.data;
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      return null;
-    }
-    throw err;
-  } finally {
-    abortControllers.delete(key);
-  }
+  })();
+  return entry.promise;
 }
 
 // Secure element creation helper (Anti-XSS)
@@ -550,6 +563,7 @@ function renderCarousel(container, items, type) {
 
 // Setup Dynamic Featured Hero Banner
 async function setupHeroBanner(item) {
+  const revision = ++heroRevision;
   const heroBanner = document.getElementById("hero-banner");
   const heroTitle = document.getElementById("hero-title");
   const heroSynopsis = document.getElementById("hero-synopsis");
@@ -563,6 +577,8 @@ async function setupHeroBanner(item) {
   const cleanTitle = item.title.replace("VER ", "").replace(" Online Gratis HD", "");
   heroTitle.textContent = cleanTitle;
   heroRating.textContent = item.rating || "N/A";
+  heroSynopsis.textContent = '';
+  heroYear.textContent = item.year || 'N/A';
   heroType.textContent = item.type === "movie" ? "PELÍCULA RECOMENDADA" : item.type === "series" ? "SERIE RECOMENDADA" : "ANIME RECOMENDADO";
   
   if (item.poster) {
@@ -580,7 +596,7 @@ async function setupHeroBanner(item) {
   // Fetch details in the background to show rich info
   try {
     const fullInfo = await apiFetch(PeliRequests.info(item));
-    if (fullInfo) {
+    if (fullInfo && revision === heroRevision) {
       if (fullInfo.synopsis) {
         heroSynopsis.textContent = fullInfo.synopsis;
       }
@@ -631,6 +647,7 @@ function setupHeroRotation(items) {
 function startHeroInterval() {
   if (state.heroInterval) clearInterval(state.heroInterval);
   state.heroInterval = setInterval(() => {
+    if (document.hidden || homeView.classList.contains('hidden') || !state.heroItems.length) return;
     state.heroIndex = (state.heroIndex + 1) % state.heroItems.length;
     transitionHero(state.heroItems[state.heroIndex]);
   }, 8000);
@@ -658,6 +675,9 @@ function transitionHero(item) {
 
 // Search Scraper Aggregator
 async function performSearch(query) {
+  const revision = ++resultsRevision;
+  state.hasNextPage = false;
+  state.isLoadingMore = false;
   showGridView(`Búsqueda: "${query}"`);
   showResultsLoading(true);
   resultsEmpty.classList.add("hidden");
@@ -667,7 +687,7 @@ async function performSearch(query) {
   try {
     // Search is handled automatically by provider aggregations in backend routes
     const items = await apiFetch(`/search?s=${encodeURIComponent(query)}`);
-    
+    if (revision !== resultsRevision) return;
     state.results = items || [];
     state.hasNextPage = false; // Search doesn't paginate infinite scroll
     
@@ -675,9 +695,9 @@ async function performSearch(query) {
     const filtered = applyClientFilters(state.results);
     displayResults(filtered);
   } catch (err) {
-    showResultsError(err.message);
+    if (revision === resultsRevision) showResultsError(err.message, () => { void performSearch(query); });
   } finally {
-    showResultsLoading(false);
+    if (revision === resultsRevision) showResultsLoading(false);
   }
 }
 
@@ -714,7 +734,11 @@ function applyClientFilters(items) {
 
 // Load Advanced Filtered Catalog (Server/Client Hybrid)
 async function loadFilteredCatalog(resetPage = true) {
+  if (!resetPage && (state.isLoadingMore || !state.hasNextPage)) return;
+  const revision = resetPage ? ++resultsRevision : resultsRevision;
+  const requestedPage = resetPage ? 1 : state.currentPage + 1;
   if (resetPage) {
+    state.hasNextPage = false;
     state.currentPage = 1;
     resultsGrid.innerHTML = "";
     document.getElementById("scroll-sentinel").classList.add("hidden");
@@ -733,11 +757,12 @@ async function loadFilteredCatalog(resetPage = true) {
     // If type is 'all' and no genre selected, parallel fetch all catalogs to merge
     if (type === 'all' && !genre) {
       const [movies, series, anime] = await Promise.all([
-        apiFetch(`/catalog?type=movie&page=${state.currentPage}`).catch(() => null),
-        apiFetch(`/catalog?type=series&page=${state.currentPage}`).catch(() => null),
-        apiFetch(`/catalog?type=anime&page=${state.currentPage}`).catch(() => null)
+        apiFetch(`/catalog?type=movie&page=${requestedPage}`).catch(() => null),
+        apiFetch(`/catalog?type=series&page=${requestedPage}`).catch(() => null),
+        apiFetch(`/catalog?type=anime&page=${requestedPage}`).catch(() => null)
       ]);
       
+      if (!movies && !series && !anime) throw new Error('No se pudo cargar el catálogo. Intenta de nuevo.');
       allItems = [
         ...(movies?.items || []),
         ...(series?.items || []),
@@ -748,14 +773,24 @@ async function loadFilteredCatalog(resetPage = true) {
     } else {
       // Standard single catalog call
       const actualType = type === 'all' ? 'movie' : type;
-      const data = await apiFetch(`/catalog?type=${actualType}&genre=${genre}&page=${state.currentPage}`);
+      const data = await apiFetch(`/catalog?type=${actualType}&genre=${encodeURIComponent(genre)}&page=${requestedPage}`);
       
       allItems = data ? (data.items || []) : [];
       hasNext = data ? (data.hasNextPage || false) : false;
     }
     
-    state.hasNextPage = hasNext;
-    state.results = resetPage ? allItems : [...state.results, ...allItems];
+    if (revision !== resultsRevision) return;
+    const previous = resetPage ? [] : state.results;
+    const seen = new Set(previous.map(item => `${item.provider || ''}:${item.type}:${item.slug}`));
+    const newItems = allItems.filter(item => {
+      const key = `${item.provider || ''}:${item.type}:${item.slug}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    state.currentPage = requestedPage;
+    state.hasNextPage = hasNext && newItems.length > 0;
+    state.results = [...previous, ...newItems];
     
     // Apply Client filters (rating, sort)
     const filtered = applyClientFilters(state.results);
@@ -770,32 +805,49 @@ async function loadFilteredCatalog(resetPage = true) {
     }
     
   } catch (err) {
-    showResultsError(err.message);
+    if (revision === resultsRevision) showResultsError(err.message, () => { void loadFilteredCatalog(resetPage); });
   } finally {
-    showResultsLoading(false);
-    state.isLoadingMore = false;
+    if (revision === resultsRevision) {
+      showResultsLoading(false);
+      state.isLoadingMore = false;
+      schedulePaginationCheck();
+    }
   }
+}
+
+// Recheck after rendering: a visible sentinel may not cross another observer threshold.
+function schedulePaginationCheck() {
+  if (paginationCheckPending) return;
+  paginationCheckPending = true;
+  requestAnimationFrame(() => {
+    paginationCheckPending = false;
+    const sentinel = document.getElementById('scroll-sentinel');
+    if (!sentinel || gridView.classList.contains('hidden') || sentinel.classList.contains('hidden') ||
+        !state.hasNextPage || state.isLoadingMore) return;
+    const bounds = sentinel.getBoundingClientRect();
+    if (bounds.top <= window.innerHeight + 200 && bounds.bottom >= 0) void loadFilteredCatalog(false);
+  });
 }
 
 // Setup Intersection Observer Infinite Scroll Sentinel
 function setupInfiniteScroll() {
-  const sentinel = document.getElementById("scroll-sentinel");
+  const sentinel = document.getElementById('scroll-sentinel');
   if (!sentinel) return;
-  
-  const observer = new IntersectionObserver((entries) => {
-    const entry = entries[0];
-    if (entry.isIntersecting && state.hasNextPage && !state.isLoadingMore) {
-      state.currentPage++;
-      loadFilteredCatalog(false); // append data
-    }
-  }, { threshold: 0.1 });
-  
-  observer.observe(sentinel);
+  if (typeof IntersectionObserver !== 'undefined') {
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) schedulePaginationCheck();
+    }, { rootMargin: '200px', threshold: 0 });
+    observer.observe(sentinel);
+  }
+  window.addEventListener('scroll', schedulePaginationCheck, { passive: true });
+  window.addEventListener('resize', schedulePaginationCheck, { passive: true });
 }
 
 // Show/Hide results loading
 function showResultsLoading(show) {
   if (show) {
+    if (resultsRetryButton) resultsRetryButton.remove();
+    resultsRetryButton = null;
     resultsLoading.classList.remove("hidden");
   } else {
     resultsLoading.classList.add("hidden");
@@ -803,17 +855,26 @@ function showResultsLoading(show) {
 }
 
 // Show search errors
-function showResultsError(message) {
+function showResultsError(message, retry) {
   resultsGrid.classList.add("hidden");
   resultsEmpty.classList.remove("hidden");
   resultsEmpty.querySelector("p").textContent = `Error: ${message}. Servidor no disponible.`;
   resultsEmpty.querySelector("ion-icon").name = "warning-outline";
   resultsCount.textContent = "0 items";
   document.getElementById("scroll-sentinel").classList.add("hidden");
+  if (resultsRetryButton) resultsRetryButton.remove();
+  resultsRetryButton = null;
+  if (retry) {
+    resultsRetryButton = createEl('button', ['btn-action', 'play'], { type: 'button' }, 'Reintentar');
+    resultsRetryButton.addEventListener('click', retry);
+    resultsEmpty.appendChild(resultsRetryButton);
+  }
 }
 
 // Render Results Grid in Grid Section (Anti-XSS)
 function displayResults(items = null) {
+  if (resultsRetryButton) resultsRetryButton.remove();
+  resultsRetryButton = null;
   const renderList = items !== null ? items : state.results;
   resultsGrid.innerHTML = "";
   
@@ -887,6 +948,18 @@ function displayResults(items = null) {
 
 // Load Details in Modal
 async function loadMediaDetails(item) {
+  const revision = ++detailsRevision;
+  episodeRevision++;
+  state.selectedMedia = null;
+  state.activeSeason = 1;
+  state.activeEpisode = 1;
+  stopEmbeddedPlayback();
+  serversLoading.classList.add('hidden');
+  detailsSynopsis.textContent = 'Cargando sinopsis...';
+  detailsDirector.textContent = '';
+  detailsGenres.innerHTML = '';
+  seasonsTabsContainer.innerHTML = '';
+  episodesContainer.innerHTML = '';
   detailsEmpty.classList.add("hidden");
   detailsContent.classList.add("hidden");
   seasonsSection.classList.add("hidden");
@@ -900,7 +973,7 @@ async function loadMediaDetails(item) {
     detailsPoster.src = item.poster || "https://www.pelisplushd.la/static/img/favicon.png";
     detailsTitle.textContent = item.title.replace("VER ", "").replace(" Online Gratis HD", "");
     detailsOriginalTitle.textContent = item.slug;
-    detailsType.textContent = item.type === "movie" ? "PELICULA" : "SERIE";
+    detailsType.textContent = item.type === 'movie' ? 'PELÍCULA' : item.type === 'anime' ? 'ANIME' : 'SERIE';
     detailsYear.textContent = "Cargando...";
     detailsRating.textContent = item.rating || "N/A";
     
@@ -908,7 +981,7 @@ async function loadMediaDetails(item) {
 
     // Fetch full scraping details from backend (auto-aggregation handles providers)
     const fullInfo = await apiFetch(PeliRequests.info(item));
-    if (!fullInfo) return;
+    if (!fullInfo || revision !== detailsRevision) return;
     state.selectedMedia = fullInfo;
 
     // Populate advanced fields
@@ -941,7 +1014,7 @@ async function loadMediaDetails(item) {
       renderSeasonsTabs(fullInfo.seasons || []);
     }
   } catch (err) {
-    showToast(`Error al obtener detalles: ${err.message}`, 'error');
+    if (revision === detailsRevision) showToast(`Error al obtener detalles: ${err.message}`, 'error');
   }
 }
 
@@ -949,6 +1022,10 @@ async function loadMediaDetails(item) {
 function renderSeasonsTabs(seasons = []) {
   seasonsTabsContainer.innerHTML = "";
   episodesContainer.innerHTML = "";
+  episodeRevision++;
+  serversContainer.innerHTML = '';
+  serversLoading.classList.add('hidden');
+  stopEmbeddedPlayback();
 
   if (seasons.length === 0) {
     seasonsSection.classList.add("hidden");
@@ -977,7 +1054,11 @@ function renderSeasonsTabs(seasons = []) {
 
 // Render Episode Buttons
 function renderEpisodes(episodes = []) {
+  episodeRevision++;
+  stopEmbeddedPlayback();
   episodesContainer.innerHTML = "";
+  serversContainer.innerHTML = '';
+  serversLoading.classList.add('hidden');
 
   episodes.forEach((episode, index) => {
     const btn = document.createElement("button");
@@ -1003,19 +1084,29 @@ function renderEpisodes(episodes = []) {
 
 // Fetch Servers for Episode
 async function fetchEpisodeServers(episode) {
-  serversContainer.innerHTML = "";
-  serversLoading.classList.remove("hidden");
+  const revision = ++episodeRevision;
+  const media = state.selectedMedia;
+  if (!media) return;
+  const season = state.activeSeason;
+  const episodeNumber = episode.number;
+  const current = () => revision === episodeRevision && media === state.selectedMedia &&
+    season === state.activeSeason && episodeNumber === state.activeEpisode;
+  stopEmbeddedPlayback();
+  serversContainer.innerHTML = '';
+  serversLoading.classList.remove('hidden');
 
   try {
-    const data = await apiFetch(PeliRequests.servers(state.selectedMedia, state.activeSeason, episode.number));
-    renderServers(data.servers || [], episode.url);
+    const data = await apiFetch(PeliRequests.servers(media, season, episodeNumber));
+    if (!current() || !data) return;
+    renderServers(data.servers || [], episode.url || data.url);
   } catch (err) {
-    const errorDiv = createEl("div", ["downloads-empty"]);
-    const errorText = createEl("p", [], {}, `Error al obtener servidores: ${err.message}`);
+    if (!current()) return;
+    const errorDiv = createEl('div', ['downloads-empty']);
+    const errorText = createEl('p', [], {}, `Error al obtener servidores: ${err.message}`);
     errorDiv.appendChild(errorText);
     serversContainer.appendChild(errorDiv);
   } finally {
-    serversLoading.classList.add("hidden");
+    if (current()) serversLoading.classList.add('hidden');
   }
 }
 
@@ -1095,12 +1186,17 @@ function renderServers(servers = [], contentUrl = null) {
 
 // Play embed video in the integrated player
 function playEmbedVideo(embedUrl, serverName, language) {
+  if (!state.selectedMedia) return;
+  let target;
+  try { target = new URL(embedUrl); } catch { return; }
+  if (!/^https?:$/.test(target.protocol)) return;
+  stopEmbeddedPlayback();
   const title = state.selectedMedia.title;
   const episodeLabel = state.selectedMedia.type === "series" || state.selectedMedia.type === "anime"
     ? ` — Temp ${state.activeSeason} Cap ${state.activeEpisode}`
     : "";
-  playerTitle.textContent = `Reproduciendo: ${title}${episodeLabel} — ${serverName.toUpperCase()} (${language})`;
-  playerIframe.src = embedUrl;
+  playerTitle.textContent = `Reproduciendo: ${title}${episodeLabel} — ${String(serverName || "Servidor").toUpperCase()} (${language || "Sin especificar"})`;
+  playerIframe.src = target.href;
   videoPlayerContainer.classList.remove("hidden");
   
   // Smooth scroll video player container into view inside modal

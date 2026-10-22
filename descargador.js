@@ -5,6 +5,27 @@ const pelisplusService = require("./src/services/pelisplus.service");
 const repelishdService = require("./src/services/repelishd.service");
 const cuevanaService = require("./src/services/cuevana.service");
 const downloadService = require("./src/services/download.service");
+const { cleanup } = require("./src/utils/browser");
+
+// The reusable browser module has no process-wide signal handlers.
+// This CLI owns shutdown and closes its shared browser when interrupted.
+let shuttingDown = false;
+let cliHasActiveWork = false;
+function finishCliWork() {
+  cliHasActiveWork = false;
+  void cleanupCli();
+}
+async function cleanupCli() {
+  await Promise.allSettled([downloadService.cleanup(), cleanup()]);
+}
+async function stopCli(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { await cleanupCli(); }
+  finally { process.exit(signal === 'SIGINT' ? 130 : 143); }
+}
+process.once('SIGINT', () => { void stopCli('SIGINT'); });
+process.once('SIGTERM', () => { void stopCli('SIGTERM'); });
 
 const PROVIDERS = [
   { title: "Busqueda Agregada (Todos)", value: "aggregate" },
@@ -100,6 +121,7 @@ async function main() {
     
     bar.start(100, 0, { status: "preparando..." });
 
+    cliHasActiveWork = true;
     const interval = setInterval(() => {
       try {
         const s = downloadService.getDownload(result.id);
@@ -107,14 +129,17 @@ async function main() {
         if (s.status === "completed" || s.status === "failed") {
           bar.stop();
           clearInterval(interval);
+          finishCliWork();
           if (s.status === "completed") {
-            console.log(`\nCompletado. Archivo: ${downloadService.getDownloadsDir()}\\${s.fileName}`);
+            console.log(`\nCompletado. Archivo: ${path.join(downloadService.getDownloadsDir(), s.fileName)}`);
           } else {
             console.log(`\nError: ${s.error}`);
           }
         }
       } catch (err) {
         clearInterval(interval);
+        bar.stop();
+        finishCliWork();
         console.error("Error monitoreando la descarga:", err.message);
       }
     }, 1000);
@@ -214,6 +239,7 @@ async function main() {
     
     bar.start(100, 0, { status: "preparando..." });
 
+    cliHasActiveWork = true;
     const interval = setInterval(() => {
       try {
         const s = downloadService.getDownload(result.id);
@@ -221,14 +247,17 @@ async function main() {
         if (s.status === "completed" || s.status === "failed") {
           bar.stop();
           clearInterval(interval);
+          finishCliWork();
           if (s.status === "completed") {
-            console.log(`\nCompletado. Archivo: ${downloadService.getDownloadsDir()}\\${s.fileName}`);
+            console.log(`\nCompletado. Archivo: ${path.join(downloadService.getDownloadsDir(), s.fileName)}`);
           } else {
             console.log(`\nError: ${s.error}`);
           }
         }
       } catch (err) {
         clearInterval(interval);
+        bar.stop();
+        finishCliWork();
         console.error("Error monitoreando la descarga:", err.message);
       }
     }, 1000);
@@ -321,34 +350,48 @@ async function main() {
     }, cliProgress.Presets.shades_classic);
 
     const activeDownloads = new Map();
+    const remainingEpisodes = [...episodesToDownload];
+    let completedCount = 0;
+    let failedCount = 0;
 
-    for (const ep of episodesToDownload) {
-      try {
-        const result = downloadService.createDownload(
-          { url: ep.url, quality: "1080p", variant },
-          "http://localhost"
-        );
-
-        const bar = multibar.create(100, 0, {
-          episode: `Ep ${ep.number.toString().padStart(4, "0")}`,
-          status: "Iniciando...",
-        });
-
-        activeDownloads.set(result.downloadId, { bar, completed: false, number: ep.number });
-      } catch (err) {
-        console.error(`Error ep ${ep.number}: ${err.message}`);
+    // Feed the bounded API queue as slots free up instead of discarding episodes
+    // when "todos" contains more items than the service can queue at once.
+    function enqueueEpisodes() {
+      let started = 0;
+      while (remainingEpisodes.length) {
+        const ep = remainingEpisodes[0];
+        try {
+          const result = downloadService.createDownload(
+            { url: ep.url, quality: "1080p", variant },
+            "http://localhost"
+          );
+          remainingEpisodes.shift();
+          const bar = multibar.create(100, 0, {
+            episode: `Ep ${ep.number.toString().padStart(4, "0")}`,
+            status: "Iniciando...",
+          });
+          activeDownloads.set(result.downloadId, { bar, completed: false, number: ep.number });
+          started++;
+        } catch (err) {
+          if (err.statusCode === 429) break;
+          remainingEpisodes.shift();
+          failedCount++;
+          console.error(`Error ep ${ep.number}: ${err.message}`);
+        }
       }
+      return started;
     }
+    enqueueEpisodes();
 
     if (activeDownloads.size === 0) {
+      multibar.stop();
       console.log("No se pudo iniciar ninguna descarga.");
       return;
     }
 
-    let completedCount = 0;
-    let failedCount = 0;
     const dlDir = downloadService.getDownloadsDir();
 
+    cliHasActiveWork = true;
     const interval = setInterval(() => {
       let allDone = true;
 
@@ -377,9 +420,11 @@ async function main() {
         }
       }
 
+      if (enqueueEpisodes() > 0 || remainingEpisodes.length > 0) allDone = false;
       if (allDone) {
         clearInterval(interval);
         multibar.stop();
+        finishCliWork();
         console.log(`\nTerminado: ${completedCount} completadas, ${failedCount} fallidas`);
         if (completedCount > 0) console.log(`Archivos en: ${dlDir}`);
       }
@@ -387,7 +432,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().then(async () => {
+  if (!cliHasActiveWork) await cleanupCli();
+}).catch(async (err) => {
   console.error("\nError inesperado:", err.message);
-  process.exit(1);
+  try { await cleanupCli(); }
+  finally { process.exit(1); }
 });

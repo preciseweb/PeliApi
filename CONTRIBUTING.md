@@ -30,10 +30,9 @@ Si vas a contribuir con código, sigue estos pasos para configurar tu entorno:
    git clone https://github.com/tu-usuario/peliapi.git
    cd peliapi
    ```
-3. **Instala las dependencias**, incluyendo puppeteer si vas a probar sitios con protección JS:
+3. **Usa Node.js 24 e instala las dependencias verificadas**. Puppeteer está incluido:
    ```bash
-   npm install
-   npm install puppeteer
+   npm ci
    ```
 4. **Configura el entorno:**
    ```bash
@@ -71,3 +70,5 @@ Muchos servidores sirven videos señuelo cuando detectan solicitudes automatizad
 4. Abre un Pull Request en el repositorio principal, explicando detalladamente los cambios realizados.
 
 Nuevamente, gracias por formar parte de esta comunidad.
+
+Antes de enviar cambios ejecuta `npm run check` y `npm test`. Las regresiones usan HTTP local y navegadores simulados, sin descargar videos. CI instala con `npm ci --ignore-scripts` para omitir binarios opcionales.

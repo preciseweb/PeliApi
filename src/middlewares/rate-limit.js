@@ -1,6 +1,7 @@
 const { ApiError } = require("../utils/api-error");
 
 const usageByDayAndKey = new Map();
+let usageDayStamp = "";
 
 function getUtcDayStamp(date) {
   return date.toISOString().slice(0, 10);
@@ -12,25 +13,24 @@ function getNextUtcMidnightEpochSeconds(now) {
 }
 
 function cleanupOldEntries(currentDayStamp) {
-  if (usageByDayAndKey.size < 2000) {
-    return;
-  }
-
-  for (const key of usageByDayAndKey.keys()) {
-    if (!key.endsWith(`:${currentDayStamp}`)) {
-      usageByDayAndKey.delete(key);
-    }
+  // Clear on every day rollover, even below the old 2,000-entry threshold.
+  // Authenticated keys are configured server-side, so arbitrary user input
+  // cannot create an unlimited number of counters.
+  if (usageDayStamp !== currentDayStamp) {
+    usageByDayAndKey.clear();
+    usageDayStamp = currentDayStamp;
   }
 }
 
 function dailyRateLimit(req, res, next) {
-  if (String(process.env.DISABLE_RATE_LIMIT).toLowerCase() === "true") {
+  if (String(process.env.DISABLE_RATE_LIMIT).trim().toLowerCase() === "true") {
     return next();
   }
 
   const now = new Date();
   const dayStamp = getUtcDayStamp(now);
-  const limit = Number(process.env.DAILY_REQUEST_LIMIT || 100);
+  const configuredLimit = Number(process.env.DAILY_REQUEST_LIMIT);
+  const limit = Number.isSafeInteger(configuredLimit) && configuredLimit > 0 ? configuredLimit : 100;
   const usageKey = `${req.apiKey || "anonymous"}:${dayStamp}`;
 
   cleanupOldEntries(dayStamp);
@@ -43,7 +43,8 @@ function dailyRateLimit(req, res, next) {
 
   if (currentUsage >= limit) {
     res.setHeader("X-RateLimit-Remaining", "0");
-    return next(new ApiError(403, `Limite de requests alcanzado. Tu plan permite ${limit} requests/dia.`));
+    res.setHeader("Retry-After", String(Math.max(1, resetAt - Math.floor(now.getTime() / 1000))));
+    return next(new ApiError(429, `Limite de requests alcanzado. Tu plan permite ${limit} requests/dia.`));
   }
 
   const updatedUsage = currentUsage + 1;

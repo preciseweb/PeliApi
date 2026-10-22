@@ -23,284 +23,162 @@ function asyncHandler(handler) {
 // Aplicar middlewares globales de límites de tráfico (sin requerimiento de API Key)
 router.use(dailyRateLimit);
 
+const { normalizeSlug, cleanTitle } = require("../services/content.helpers");
+const { createContentCache } = require("../utils/content-cache");
+const contentCache = createContentCache();
+const services = { pelisplus: pelisplusService, repelishd: repelishdService, cuevana3: cuevanaService };
+
+function scalar(value, label, fallback) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !value.trim()) throw new ApiError(400, `${label} no válido`);
+  return value.trim();
+}
+
+function providerFor(req, slug = "") {
+  const requested = scalar(req.query.provider, "Proveedor", "");
+  if (requested) {
+    if (!Object.hasOwn(services, requested)) throw new ApiError(400, "Proveedor no válido");
+    return requested;
+  }
+  if (slug.startsWith("ver-pelicula/") || slug.includes("-online-espanol")) return "repelishd";
+  if (slug.includes("/") && !/^(?:pelicula|serie|anime)\//.test(slug)) return "cuevana3";
+  return "pelisplus";
+}
+
+function contentType(value, fallback, allowed = ["movie", "series", "anime"]) {
+  const type = scalar(value, "Tipo de contenido", fallback);
+  if (!allowed.includes(type)) throw new ApiError(400, "Tipo de contenido no válido");
+  return type;
+}
+
+function cachedRead(prepare) {
+  return asyncHandler(async (req, res) => {
+    const { key, lifetime, load } = prepare(req);
+    const result = await contentCache.get(JSON.stringify(key), lifetime, load);
+    res.set("Cache-Control", "no-store");
+    res.status(200).json({ success: true, ...result });
+  });
+}
+
+async function searchProviders(query, requestedProvider, requestedType) {
+  let successfulSearches = 0;
+  const search = async provider => {
+    try {
+      const results = await services[provider].searchContent(query);
+      if (!Array.isArray(results)) throw new ApiError(502, "Respuesta de búsqueda no válida");
+      successfulSearches += 1;
+      const seen = new Set();
+      return results.filter(item => {
+        if (!item || typeof item.title !== "string" || typeof item.slug !== "string" || !item.slug) return false;
+        if (requestedType && (item.type === "movie") !== (requestedType === "movie")) return false;
+        const key = `${item.type || ""}:${item.slug}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return Boolean(cleanTitle(item.title));
+      }).map(item => ({ ...item, title: cleanTitle(item.title), provider }));
+    } catch (error) {
+      console.error(`Error buscando en ${provider}:`, error.message);
+      return [];
+    }
+  };
+  // Lightweight sources run in parallel; browser fallback is used only when
+  // no source returned results. An explicit provider never changes identity.
+  let data;
+  if (requestedProvider) data = await search(requestedProvider);
+  else {
+    // RePelisHD only publishes movies. Episode searches must not wait for a
+    // source that cannot supply the requested series or anime.
+    const [ppData, rpData] = await Promise.all([
+      search("pelisplus"), requestedType && requestedType !== "movie" ? [] : search("repelishd"),
+    ]);
+    data = [...rpData, ...ppData];
+  }
+  if (!requestedProvider && !data.length) data = await search("cuevana3");
+  if (!data.length && successfulSearches === 0) {
+    throw new ApiError(503, "Los proveedores de búsqueda no respondieron. Reintenta en unos minutos.");
+  }
+  const titleKey = value => cleanTitle(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const needle = titleKey(query);
+  const score = title => {
+    const key = titleKey(title);
+    return key === needle ? 0 : key.startsWith(needle) ? 1 : key.includes(needle) ? 2 : 3;
+  };
+  data.sort((a, b) => score(a.title) - score(b.title));
+  const providers = new Set(data.map(item => item.provider));
+  return { data, source: providers.size === 1 ? data[0].provider : requestedProvider || "aggregate" };
+}
+
 /**
  * Buscar contenido (películas, series, anime)
- * GET /search?s=avatar o GET /search?q=avatar
+ * GET /search?s=avatar o GET /search?q=avatar; provider es opcional.
  */
-router.get(
-  "/search",
-  asyncHandler(async (req, res) => {
-    const rawQuery = req.query.s || req.query.q || "";
-    const query = typeof rawQuery === "string" ? rawQuery.trim() : "";
-
-    if (!query || query.length > 200) {
-      throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
-    }
-
-    let data = [];
-    let source = "aggregate";
-    let successfulSearches = 0;
-
-    // 1. Buscamos en PelisPlus y RePelisHD en paralelo (ambos son ultraligeros con Cheerio)
-    try {
-      const [ppData, rpData] = await Promise.all([
-        pelisplusService.searchContent(query).then(results => {
-          successfulSearches += 1;
-          return results;
-        }).catch(err => {
-          console.error("Error buscando en PelisPlus:", err.message);
-          return [];
-        }),
-        repelishdService.searchContent(query).then(results => {
-          successfulSearches += 1;
-          return results;
-        }).catch(err => {
-          console.error("Error buscando en RePelisHD:", err.message);
-          return [];
-        })
-      ]);
-
-      const ppMapped = (ppData || []).map(item => ({ ...item, provider: "pelisplus" }));
-      const rpMapped = (rpData || []).map(item => ({ ...item, provider: "repelishd" }));
-      
-      data = [...rpMapped, ...ppMapped];
-
-      // Ordenar inteligentemente los resultados combinados para poner las coincidencias más cercanas al query al principio
-      const lowerQuery = query.toLowerCase().trim();
-      data.sort((a, b) => {
-        const aTitle = a.title.toLowerCase();
-        const bTitle = b.title.toLowerCase();
-
-        // Coincidencia exacta de título
-        const aExact = aTitle === lowerQuery || aTitle === `[${lowerQuery}]`;
-        const bExact = bTitle === lowerQuery || bTitle === `[${lowerQuery}]`;
-        if (aExact && !bExact) return -1;
-        if (!aExact && bExact) return 1;
-
-        // Comienza con el query
-        const aStarts = aTitle.startsWith(lowerQuery) || aTitle.startsWith(`[${lowerQuery}`);
-        const bStarts = bTitle.startsWith(lowerQuery) || bTitle.startsWith(`[${lowerQuery}`);
-        if (aStarts && !bStarts) return -1;
-        if (!aStarts && bStarts) return 1;
-
-        // Contiene el query
-        const aIncludes = aTitle.includes(lowerQuery);
-        const bIncludes = bTitle.includes(lowerQuery);
-        if (aIncludes && !bIncludes) return -1;
-        if (!aIncludes && bIncludes) return 1;
-
-        return 0;
-      });
-
-      if (data.length > 0) {
-        source = rpMapped.length > 0 ? "repelishd" : "pelisplus";
-      }
-    } catch (error) {
-      console.error("Error en búsqueda paralela:", error.message);
-    }
-
-    // 2. Si aún no obtuvimos resultados, probamos en Cuevana3 (Puppeteer, más lento)
-    if (data.length === 0) {
-      try {
-        const cuevanaData = await cuevanaService.searchContent(query);
-        successfulSearches += 1;
-        data = (cuevanaData || []).map(item => ({ ...item, provider: "cuevana3" }));
-        source = "cuevana3";
-      } catch (error) {
-        console.error("Error buscando en Cuevana3:", error.message);
-      }
-    }
-
-    if (data.length === 0 && successfulSearches === 0) {
-      throw new ApiError(503, "Los proveedores de búsqueda no respondieron. Reintenta en unos minutos.");
-    }
-
-    res.status(200).json({
-      success: true,
-      data,
-      source,
-    });
-  })
-);
+router.get("/search", cachedRead(req => {
+  const query = scalar(req.query.s ?? req.query.q, "El parámetro de búsqueda 's' o 'q'", "").normalize("NFC");
+  if (!query || query.length > 200) throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
+  const provider = req.query.provider === undefined ? "" : providerFor(req);
+  const type = req.query.type === undefined ? "" : contentType(req.query.type, "");
+  return { key: ["search", query, provider, type], lifetime: 60000, load: () => searchProviders(query, provider, type) };
+}));
 
 /**
  * Obtener catálogo filtrado por tipo, género y página
  * GET /catalog?type=movie&genre=accion&page=1
  */
-router.get(
-  "/catalog",
-  asyncHandler(async (req, res) => {
-    const type = req.query.type || "movie"; // movie, series, anime
-    const genre = req.query.genre || "";
-    const page = Number(req.query.page || 1);
-
-    // El catálogo se sirve de PelisPlus porque Cuevana3 no tiene endpoints estructurados
+router.get("/catalog", cachedRead(req => {
+  const type = contentType(req.query.type, "movie");
+  const genre = req.query.genre === undefined || req.query.genre === "" ? "" : normalizeSlug(scalar(req.query.genre, "Género"));
+  const page = Number(scalar(req.query.page, "Página", "1"));
+  if (!Number.isSafeInteger(page) || page < 1) throw new ApiError(400, "Página no válida");
+  return { key: ["catalog", type, genre, page], lifetime: 60000, load: async () => {
+    // El catálogo se sirve de PelisPlus porque Cuevana3 no tiene endpoints estructurados.
     const data = await pelisplusService.getCatalog(type, genre, page);
-    if (data && data.items) {
-      data.items = data.items.map(item => ({ ...item, provider: "pelisplus" }));
-    }
-    
-    res.status(200).json({
-      success: true,
-      data,
-      source: "pelisplus",
-    });
-  })
-);
+    if (!data || !Array.isArray(data.items)) throw new ApiError(502, "El proveedor devolvió un catálogo no válido");
+    return { data: { ...data, items: data.items.map(item => ({ ...item, provider: "pelisplus" })) }, source: "pelisplus" };
+  } };
+}));
 
-/**
- * Obtener géneros disponibles
- * GET /genres
- */
-router.get(
-  "/genres",
-  asyncHandler(async (req, res) => {
-    // Los géneros se obtienen de PelisPlus
-    const data = await pelisplusService.getGenres();
-    res.status(200).json({
-      success: true,
-      data,
-      source: "pelisplus",
-    });
-  })
-);
+/** Obtener géneros disponibles. GET /genres */
+router.get("/genres", cachedRead(() => ({
+  key: ["genres"], lifetime: 600000,
+  load: async () => ({ data: await pelisplusService.getGenres(), source: "pelisplus" }),
+})));
 
 /**
  * Obtener detalles y servidores de reproducción de una película o serie
  * GET /info/:slug?type=movie
  */
-router.get(
-  "/info/*",
-  asyncHandler(async (req, res) => {
-    const slug = req.params[0];
-    const type = req.query.type || (slug.startsWith("anime/") ? "anime" : slug.startsWith("serie/") ? "series" : "movie"); // movie, series, anime
-    let provider = req.query.provider;
-    if (!["movie", "series", "anime"].includes(type)) throw new ApiError(400, "Tipo de contenido no válido");
-    if (provider && !["pelisplus", "repelishd", "cuevana3"].includes(provider)) throw new ApiError(400, "Proveedor no válido");
-
-    // Auto-detectar si el slug contiene "/" o tiene el patrón de RePelisHD
-    if (!provider) {
-      if (slug.includes("/") && !slug.startsWith("pelicula/") && !slug.startsWith("serie/") && !slug.startsWith("anime/")) {
-        provider = "cuevana3";
-      } else if (slug.includes("-online-espanol")) {
-        provider = "repelishd";
-      } else {
-        provider = "pelisplus";
-      }
-    }
-
-    let data;
-    let source = provider;
-
-    try {
-      let service;
-      if (provider === "cuevana3") service = cuevanaService;
-      else if (provider === "repelishd") service = repelishdService;
-      else service = pelisplusService;
-
-      data = await service.getContentInfo(slug, type);
-    } catch (error) {
-      // Si falló y estábamos intentando con PelisPlus, intentamos en cascada
-      if (provider === "pelisplus" && error.statusCode !== 400) {
-        try {
-          console.log(`Cascading info request to RePelisHD for slug: ${slug}`);
-          data = await repelishdService.getContentInfo(slug, type);
-          source = "repelishd";
-        } catch (repelisError) {
-          try {
-            console.log(`Cascading info request to Cuevana3 for slug: ${slug}`);
-            data = await cuevanaService.getContentInfo(slug, type);
-            source = "cuevana3";
-          } catch (cascadeError) {
-            console.error("Cuevana3 cascade failed too:", cascadeError.message);
-            throw error; // lanzamos el error original de pelisplus
-          }
-        }
-      } else {
-        throw error;
-      }
-    }
-
-    // Agregar provider al resultado para consistencia
-    if (data) {
-      data.provider = source;
-    }
-
-    res.status(200).json({
-      success: true,
-      data,
-      source,
-    });
-  })
-);
+router.get("/info/*", cachedRead(req => {
+  const slug = normalizeSlug(req.params[0], { nested: true });
+  const fallback = slug.startsWith("anime/") ? "anime" : slug.startsWith("serie/") ? "series" : "movie";
+  const type = contentType(req.query.type, fallback);
+  const provider = providerFor(req, slug);
+  return { key: ["info", provider, type, slug], lifetime: type === "movie" ? 20000 : 60000, load: async () => {
+    // A slug belongs to its provider. Reusing it on a different site can return
+    // another title or an empty page; callers must select a confirmed match.
+    const data = await services[provider].getContentInfo(slug, type);
+    if (!data || typeof data !== "object") throw new ApiError(502, "El proveedor devolvió una ficha no válida");
+    return { data: { ...data, provider }, source: provider };
+  } };
+}));
 
 /**
  * Obtener servidores de reproducción para un capítulo de una serie o anime
  * GET /servers?slug=breaking-bad&season=1&episode=1
  */
-router.get(
-  "/servers",
-  asyncHandler(async (req, res) => {
-    const slug = req.query.slug || req.query.serieSlug;
-    const { seasonNumber: season, episodeNumber: episode } = episodeNumbers(req.query.season ?? 1, req.query.episode ?? 1);
-    const type = req.query.type || (typeof slug === 'string' && slug.startsWith('anime/') ? 'anime' : 'series');
-    let provider = req.query.provider;
-    if (!['series', 'anime'].includes(type)) throw new ApiError(400, 'Tipo de episodio no válido');
-    if (provider && !['pelisplus', 'repelishd', 'cuevana3'].includes(provider)) throw new ApiError(400, 'Proveedor no válido');
-
-    if (typeof slug !== 'string' || !slug.trim()) {
-      throw new ApiError(400, "El parametro 'slug' de la serie es requerido");
-    }
-
-    // Auto-detectar si el slug contiene "/" o tiene el patrón de RePelisHD
-    if (!provider) {
-      if (slug.includes("/") && !slug.startsWith("serie/") && !slug.startsWith("anime/")) {
-        provider = "cuevana3";
-      } else if (slug.includes("-online-espanol")) {
-        provider = "repelishd";
-      } else {
-        provider = "pelisplus";
-      }
-    }
-
-    let data;
-    let source = provider;
-
-    try {
-      let service;
-      if (provider === "cuevana3") service = cuevanaService;
-      else if (provider === "repelishd") service = repelishdService;
-      else service = pelisplusService;
-
-      data = await service.getEpisodeServers(slug, season, episode, type);
-    } catch (error) {
-      if (provider === "pelisplus" && error.statusCode !== 400) {
-        try {
-          console.log(`Cascading servers request to RePelisHD for slug: ${slug}`);
-          data = await repelishdService.getEpisodeServers(slug, season, episode, type);
-          source = "repelishd";
-        } catch (repelisError) {
-          try {
-            console.log(`Cascading servers request to Cuevana3 for slug: ${slug}`);
-            data = await cuevanaService.getEpisodeServers(slug, season, episode, type);
-            source = "cuevana3";
-          } catch (cascadeError) {
-            console.error("Cuevana3 cascade failed too:", cascadeError.message);
-            throw error;
-          }
-        }
-      } else {
-        throw error;
-      }
-    }
-
-    res.status(200).json({
-      success: true,
-      data,
-      source,
-    });
-  })
-);
+router.get("/servers", cachedRead(req => {
+  const slug = normalizeSlug(scalar(req.query.slug ?? req.query.serieSlug, "El slug de la serie"), { nested: true });
+  const { seasonNumber: season, episodeNumber: episode } = episodeNumbers(
+    scalar(req.query.season, "Temporada", "1"), scalar(req.query.episode, "Episodio", "1")
+  );
+  if (!Number.isSafeInteger(season) || !Number.isSafeInteger(episode)) throw new ApiError(400, "Temporada o episodio no válido");
+  const type = contentType(req.query.type, slug.startsWith("anime/") ? "anime" : "series", ["series", "anime"]);
+  const provider = providerFor(req, slug);
+  return { key: ["servers", provider, type, slug, season, episode], lifetime: 15000, load: async () => {
+    const data = await services[provider].getEpisodeServers(slug, season, episode, type);
+    if (!data || !Array.isArray(data.servers)) throw new ApiError(502, "El proveedor devolvió servidores no válidos");
+    return { data, source: provider };
+  } };
+}));
 
 /**
  * Resolver una URL de embed a enlace directo de video (.mp4, .m3u8)

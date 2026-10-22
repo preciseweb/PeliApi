@@ -187,7 +187,8 @@ test('Cuevana anime episode routes remove anime prefix and support special seaso
   assert.equal(result.season, 0);
   assert.equal(result.servers[0].name, 'Español');
   await assert.rejects(api.getEpisodeServers('fine', -1, 1), { statusCode: 400 });
-  await assert.rejects(service('cuevana').getContentInfo('missing'), { statusCode: 404 });
+  // Unrecognized/empty HTML is an unavailable source, not evidence of a missing title.
+  await assert.rejects(service('cuevana').getContentInfo('missing'), { statusCode: 503 });
 });
 
 test('PelisPlus tries the alternate anime route when a valid page has no servers', async () => {
@@ -229,7 +230,7 @@ test('PelisPlus retries only an empty accented query with its legacy database sp
   const api = service('pelisplus', { fetchHtml: async url => {
     const query = new URL(url).searchParams.get('s');
     queries.push(query);
-    return query === 'El niÃ±o' ? cards : '';
+    return query === 'El niÃ±o' ? cards : '<div class="Posters"></div>';
   } });
   assert.equal((await api.searchContent('El niño'))[0].title, 'El niño');
   assert.deepEqual(queries, ['El niño', 'El niÃ±o']);
@@ -241,7 +242,7 @@ test('PelisPlus does not broaden a successful search or loop after an empty fall
   assert.equal((await api.searchContent('Spider-Man: Un nuevo día')).length, 2);
   assert.equal(successful.length, 1);
   const empty = [];
-  const missing = service('pelisplus', { fetchHtml: async url => { empty.push(new URL(url).searchParams.get('s')); return ''; } });
+  const missing = service('pelisplus', { fetchHtml: async url => { empty.push(new URL(url).searchParams.get('s')); return '<div class="Posters"></div>'; } });
   assert.deepEqual(await missing.searchContent('Spider-Man: Missing'), []);
   assert.deepEqual(empty, ['Spider-Man: Missing', 'Spider-Man']);
   empty.length = 0;

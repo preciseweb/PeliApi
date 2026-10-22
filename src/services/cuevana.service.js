@@ -1,204 +1,181 @@
-const { scrapeWithPage } = require("../utils/browser");
-const { ApiError } = require("../utils/api-error");
-const { cleanText, cleanTitle, normalizeSlug, encodedSlug, episodeNumbers, repairMetadata } = require("./content.helpers");
+const cheerio = require('cheerio');
+const { fetchHtml } = require('../utils/http');
+const { scrapeWithPage } = require('../utils/browser');
+const { ApiError } = require('../utils/api-error');
+const { cleanText, cleanTitle, absoluteUrl, sourceUrl, serverKey, uniqueServers, normalizeSlug, encodedSlug, episodeNumbers, repairMetadata } = require('./content.helpers');
+
+const BASE_URL = (process.env.CUEVANA_DOMAIN || 'https://ww9.cuevana3.to').replace(/\/+$/, '');
+
+// Most Cuevana pages render their metadata and embeds in HTML. Avoid requiring a
+// Chromium process for those pages; retain browser fallback for challenges only.
+async function readContent(url, parse) {
+  try {
+    const html = await fetchHtml(url);
+    const result = parse(cheerio.load(html));
+    if (result !== null) return result;
+  } catch (error) {
+    if ((error.upstreamStatus || error.statusCode) === 404) throw new ApiError(404, 'Contenido no encontrado en Cuevana3');
+    if (![403, 429, 503].includes(error.upstreamStatus || error.statusCode)) throw error;
+  }
+  const rendered = await scrapeWithPage(url, () => document.documentElement.outerHTML);
+  // Preserve compatibility with browser adapters which already extract metadata.
+  if (rendered && typeof rendered === 'object') return rendered;
+  const result = typeof rendered === 'string' ? parse(cheerio.load(rendered)) : null;
+  if (result === null) throw new ApiError(503, 'Cuevana3 no devolvió una página de contenido válida');
+  return result;
+}
+
+function contentSlug(href) {
+  const url = sourceUrl(href, BASE_URL);
+  if (!url) return '';
+  // ej: "2225/scary-movie-2" o "serie/como-peces-dorados"
+  const path = new URL(url).pathname.replace(/^\/+|\/+$/g, '');
+  if (!/^(?:serie|anime|pelicula|\d+)\/[^/]+$/.test(path)) return '';
+  try { return normalizeSlug(path, { nested: true }); } catch { return ''; }
+}
+
+function parseSearch($) {
+  const cards = $('.MovieList .TPost, .MovieList li, .TPost');
+  if (!cards.length && !$('.MovieList, .NoResults, .no-results').length
+    && !/no se (?:encontraron|han encontrado) resultados|sin resultados/i.test($('main, #content').text())) return null;
+  const results = [];
+  cards.each((_, element) => {
+    const card = $(element);
+    const link = card.find('a').first();
+    const url = sourceUrl(link.attr('href') || '', BASE_URL);
+    const slug = contentSlug(url);
+    const title = cleanTitle(card.find('.Title').first().text());
+    if (!slug || !title) return;
+    const image = card.find('img').first();
+    results.push({
+      id: slug, slug, title, url,
+      type: slug.startsWith('serie/') ? 'series' : slug.startsWith('anime/') ? 'anime' : 'movie',
+      poster: absoluteUrl(image.attr('data-src') || image.attr('src') || '', BASE_URL),
+      rating: cleanText(card.find('.Vote').first().text()) || null,
+      year: cleanText(card.find('.Year').first().text()).match(/(?:18|19|20|21)\d{2}/)?.[0] || null,
+    });
+  });
+  // De-duplicar resultados por slug
+  return [...new Map(results.map(item => [item.slug, item])).values()];
+}
 
 /**
  * Busca contenido en Cuevana3 usando Puppeteer
  */
 async function searchContent(query) {
-  const url = `https://ww9.cuevana3.to/?s=${encodeURIComponent(query)}`;
-  
-  const response = await scrapeWithPage(url, () => {
-    const results = [];
-    const elements = document.querySelectorAll('.MovieList .TPost, .MovieList li, .TPost');
-    elements.forEach(el => {
-      const linkEl = el.querySelector('a');
-      const titleEl = el.querySelector('.Title');
-      const imgEl = el.querySelector('img');
-      const ratingEl = el.querySelector('.Vote');
-      const yearEl = el.querySelector('.Year');
-      
-      if (linkEl && titleEl) {
-        const href = linkEl.href;
-        const rawSlug = href.split("cuevana3.to/").pop(); // ej: "2225/scary-movie-2" o "serie/como-peces-dorados"
-        const slug = rawSlug.split("/").filter(Boolean).join("/");
-        const isSeries = href.includes('/serie/');
-        const isAnime = href.includes('/anime/');
-        const type = isSeries ? 'series' : (isAnime ? 'anime' : 'movie');
-        
-        let poster = imgEl ? (imgEl.getAttribute('data-src') || imgEl.src) : '';
-        if (poster && poster.startsWith('/')) {
-          poster = 'https://ww9.cuevana3.to' + poster;
-        }
+  if (typeof query !== 'string' || !query.trim()) throw new ApiError(400, "El parametro de busqueda 's' o 'q' es requerido");
+  const url = `${BASE_URL}/?s=${encodeURIComponent(query.trim())}`;
+  const response = await readContent(url, parseSearch);
+  return repairMetadata(response || []).map(item => ({ ...item, title: cleanTitle(item.title) }));
+}
 
-        results.push({
-          id: slug,
-          slug: slug,
-          title: titleEl.textContent.trim(),
-          poster: poster,
-          rating: ratingEl ? ratingEl.textContent.trim() : null,
-          year: yearEl ? yearEl.textContent.trim() : null,
-          type: type,
-          url: href
-        });
-      }
-    });
-    
-    // De-duplicar resultados por slug
-    const uniqueResults = [];
-    const seen = new Set();
-    for (const r of results) {
-      if (!seen.has(r.slug)) {
-        seen.add(r.slug);
-        uniqueResults.push(r);
+function parseServers($) {
+  const servers = [];
+  const panels = $('.TPlayerTb').toArray();
+  const panelsById = new Map(panels.map(element => [$(element).attr('id'), element]));
+  const menus = $('.TPlayerNv > li.open_submenu');
+  let iframeIndex = 0;
+
+  function add(button, language) {
+    const targetElement = button.is('[data-tplayernv], [data-target], [href]') ? button : button.find('[data-tplayernv], [data-target], a[href]').first();
+    const href = targetElement.attr('href') || '';
+    const target = targetElement.attr('data-tplayernv') || targetElement.attr('data-target') || (href.startsWith('#') ? href : '');
+    const targetId = target.replace(/^#/, '');
+    // Explicit tab identities survive missing/reordered panels. Never substitute
+    // another language's iframe when a declared target does not exist.
+    const panel = target && !target.includes('/') ? panelsById.get(targetId) : panels[iframeIndex];
+    iframeIndex++;
+    if (!panel) return;
+    const iframe = $(panel).find('iframe').first();
+    const embedUrl = absoluteUrl(iframe.attr('data-src') || iframe.attr('src') || '', BASE_URL);
+    if (!embedUrl) return;
+    const fullName = cleanText(button.text());
+    const name = cleanText(fullName.replace(/^\d+\s*[-.:]\s*/, '')) || cleanText(iframe.attr('title')) || 'Desconocido';
+    servers.push({ name, server: serverKey(name, embedUrl), language: language || 'Desconocido', embedUrl });
+  }
+
+  menus.each((_, element) => {
+    const menu = $(element);
+    const label = menu.clone();
+    label.children('ul, .sub-menu, .dropdown-menu').remove();
+    const language = cleanText(label.text()).split(/CALIDAD/i)[0].trim() || cleanText(menu.find('img').first().attr('alt')) || 'Desconocido';
+    menu.find('ul li, .clili').filter((_, button) => !$(button).find('li, .clili').length).each((_, button) => add($(button), language));
+  });
+  if (!menus.length) {
+    const buttons = $('.TPlayerNv li').filter((_, element) => !$(element).find('li').length);
+    buttons.each((_, element) => add($(element), cleanText($(element).attr('data-language'))));
+    if (!buttons.length) {
+      for (const panel of panels) {
+        const iframe = $(panel).find('iframe').first();
+        const embedUrl = absoluteUrl(iframe.attr('data-src') || iframe.attr('src') || '', BASE_URL);
+        if (!embedUrl) continue;
+        const name = cleanText($(panel).attr('data-server') || iframe.attr('title')) || 'Desconocido';
+        servers.push({ name, server: serverKey(name, embedUrl), language: cleanText($(panel).attr('data-language')) || 'Desconocido', embedUrl });
       }
     }
-    return uniqueResults;
+  }
+  return uniqueServers(servers);
+}
+
+function parseSeasons($, slug) {
+  const seasonsMap = new Map();
+  const owner = slug.replace(/^(?:serie|anime)\//, '');
+  $('a[href*="/episodio/"]').each((_, element) => {
+    const href = sourceUrl($(element).attr('href') || '', BASE_URL);
+    const match = href && new URL(href).pathname.match(/^\/episodio\/(.+)-(\d+)x(\d+)\/?$/);
+    if (!match) return;
+    let episodeOwner;
+    try { episodeOwner = normalizeSlug(match[1], { nested: true }); } catch { return; }
+    const season = Number(match[2]);
+    const number = Number(match[3]);
+    if (episodeOwner !== owner || !Number.isSafeInteger(season) || !Number.isSafeInteger(number) || number < 1) return;
+    if (!seasonsMap.has(season)) seasonsMap.set(season, new Map());
+    if (!seasonsMap.get(season).has(number)) seasonsMap.get(season).set(number, {
+      number, title: cleanText($(element).text()) || `Episodio ${number}`, url: href, season,
+    });
   });
-  return repairMetadata(response || []).map(item => ({ ...item, title: cleanTitle(item.title) }));
+  return [...seasonsMap].map(([number, episodes]) => ({ number, name: `Temporada ${number}`, episodes: [...episodes.values()].sort((a, b) => a.number - b.number) })).sort((a, b) => a.number - b.number);
 }
 
 /**
  * Obtiene la información detallada de una película o serie de Cuevana3
  */
-async function getContentInfo(slug, type = "movie") {
+async function getContentInfo(slug, type = 'movie') {
+  if (!['movie', 'series', 'anime'].includes(type)) throw new ApiError(400, 'El tipo de contenido no es válido');
   slug = normalizeSlug(slug, { nested: true });
-  const url = `https://ww9.cuevana3.to/${encodedSlug(slug)}`;
-  
-  const result = await scrapeWithPage(url, () => {
-    const title = document.querySelector('h1.Title')?.textContent.trim() || '';
-    const synopsis = document.querySelector('.Description p, .Description')?.textContent.trim() || '';
-    let poster = document.querySelector('.Image img')?.src || '';
-    if (poster && poster.startsWith('/')) {
-      poster = 'https://ww9.cuevana3.to' + poster;
-    }
-    
-    const yearMatch = document.querySelector('.InfoList li')?.textContent.trim().match(/\d{4}/);
-    const year = yearMatch ? yearMatch[0] : null;
-    const rating = document.querySelector('.percircle')?.textContent.trim() || null;
-    
+  const url = `${BASE_URL}/${encodedSlug(slug)}`;
+  const result = await readContent(url, $ => {
+    const title = cleanTitle($('h1.Title').first().text());
+    if (!title) return null;
     // Check type inside browser by checking page structure or url pattern
-    const currentUrl = window.location.href;
-    const isSeriesPage = currentUrl.includes('/serie/') || currentUrl.includes('/anime/') || document.querySelectorAll('a[href*="/episodio/"]').length > 0;
-    
+    const isSeriesPage = /^(?:serie|anime)\//.test(slug) || type !== 'movie';
+    const image = $('.Image img').first();
     const info = {
-      title: title,
-      originalTitle: title,
-      synopsis: synopsis,
-      poster: poster,
-      rating: rating,
-      year: year,
-      genres: [],
-      cast: [],
-      directors: [],
-      url: currentUrl
+      title, originalTitle: title,
+      synopsis: cleanText($('.Description p, .Description').first().text()),
+      poster: absoluteUrl(image.attr('data-src') || image.attr('src') || '', BASE_URL),
+      year: cleanText($('.InfoList li, .InfoList .Date, .Year').text()).match(/(?:18|19|20|21)\d{2}/)?.[0] || null,
+      rating: cleanText($('.percircle, .Vote').first().text()) || null,
+      genres: [], cast: [], directors: [], url,
     };
-    
     // Parsear géneros
-    const genreLinks = document.querySelectorAll('.InfoList a[href*="/genero/"], .Description a[href*="/genero/"], .Genres a[href*="/genero/"]');
-    genreLinks.forEach(g => {
-      const gName = g.textContent.trim();
-      const gSlug = g.href.split("/").filter(Boolean).pop();
-      if (gName && !info.genres.some(genre => genre.name === gName)) {
-        info.genres.push({ name: gName, slug: gSlug });
-      }
+    $('.InfoList a[href*="/genero/"], .Description a[href*="/genero/"], .Genres a[href*="/genero/"]').each((_, element) => {
+      const name = cleanText($(element).text());
+      const href = sourceUrl($(element).attr('href'), BASE_URL);
+      const match = href && new URL(href).pathname.match(/^\/genero\/([^/]+)\/?$/);
+      if (name && match && !info.genres.some(genre => genre.name === name)) info.genres.push({ name, slug: match[1] });
     });
-
     if (!isSeriesPage) {
       // Parsear servidores de reproducción
-      const servers = [];
-      const languageMenus = document.querySelectorAll('.TPlayerNv > li.open_submenu');
-      const tbDivs = document.querySelectorAll('.TPlayerTb');
-      let iframeIndex = 0;
-
-      languageMenus.forEach(langMenu => {
-        const langNameText = langMenu.childNodes[0]?.textContent.trim() || langMenu.textContent.trim();
-        const langName = langNameText.split('CALIDAD')[0].trim();
-        
-        const serverLiList = langMenu.querySelectorAll('ul li, .clili');
-        serverLiList.forEach(serverLi => {
-          const serverNameFull = serverLi.textContent.trim();
-          const serverNameParts = serverNameFull.split('-').map(s => s.trim());
-          const serverName = serverNameParts[1] || serverNameFull;
-          
-          const correspondingDiv = tbDivs[iframeIndex];
-          if (correspondingDiv) {
-            const iframe = correspondingDiv.querySelector('iframe');
-            const embedUrl = iframe ? (iframe.getAttribute('data-src') || iframe.src) : '';
-            
-            if (embedUrl) {
-              let serverKey = serverName.toLowerCase().replace(/[^a-z0-9]/g, "");
-              if (serverKey.includes("streamwish") || embedUrl.includes("streamwish")) serverKey = "streamwish";
-              else if (serverKey.includes("voesx") || serverKey.includes("voe") || embedUrl.includes("voe.sx")) serverKey = "voesx";
-              else if (serverKey.includes("streamtape") || embedUrl.includes("streamtape")) serverKey = "streamtape";
-              else if (serverKey.includes("netu") || serverKey.includes("hqq") || embedUrl.includes("hqq") || embedUrl.includes("waaw") || embedUrl.includes("netu")) serverKey = "netu";
-              else if (serverKey.includes("vidhide") || serverKey.includes("vidhide") || embedUrl.includes("filelions")) serverKey = "vidhide";
-
-              servers.push({
-                name: serverName,
-                server: serverKey,
-                language: langName,
-                embedUrl: embedUrl
-              });
-            }
-          }
-          iframeIndex++;
-        });
-      });
-
-      info.servers = servers;
+      info.servers = parseServers($);
     } else {
       // Parsear temporadas y capítulos para series
-      info.seasons = [];
-      const episodeLinks = Array.from(document.querySelectorAll('a')).map(a => ({
-        text: a.textContent.trim(),
-        href: a.href
-      })).filter(l => l.href.includes('/episodio/'));
-
-      const seasonsMap = new Map();
-      episodeLinks.forEach(ep => {
-        const match = new URL(ep.href).pathname.match(/(\d+)x(\d+)\/?$/);
-        if (match) {
-          const seasonNum = Number(match[1]);
-          const episodeNum = Number(match[2]);
-
-          if (!seasonsMap.has(seasonNum)) {
-            seasonsMap.set(seasonNum, []);
-          }
-
-          if (seasonsMap.get(seasonNum).some(episode => episode.number === episodeNum)) return;
-          seasonsMap.get(seasonNum).push({
-            number: episodeNum,
-            title: `Episodio ${episodeNum}`,
-            url: ep.href,
-            season: seasonNum
-          });
-        }
-      });
-
-      for (const [seasonNum, episodes] of seasonsMap.entries()) {
-        episodes.sort((a, b) => a.number - b.number);
-        info.seasons.push({
-          number: seasonNum,
-          name: `Temporada ${seasonNum}`,
-          episodes: episodes
-        });
-      }
-
-      info.seasons.sort((a, b) => a.number - b.number);
+      info.seasons = parseSeasons($, slug);
     }
-
     return info;
   });
-
   if (!cleanText(result?.title)) throw new ApiError(404, 'Contenido no encontrado en Cuevana3');
-  if (result) {
-    result.title = cleanTitle(result.title);
-    result.id = slug;
-    result.slug = slug;
-    result.type = type;
-  }
-  return repairMetadata(result);
+  return repairMetadata({ ...result, title: cleanTitle(result.title), id: slug, slug, type });
 }
 
 /**
@@ -208,66 +185,13 @@ async function getEpisodeServers(serieSlug, seasonNumber, episodeNumber) {
   // Los capítulos en Cuevana3 tienen la estructura /episodio/slug-temporadaxcapitulo
   serieSlug = normalizeSlug(serieSlug, { nested: true });
   ({ seasonNumber, episodeNumber } = episodeNumbers(seasonNumber, episodeNumber));
-  const coreSlug = serieSlug.replace(/^(?:serie|anime)\//, "");
-  const url = `https://ww9.cuevana3.to/episodio/${encodedSlug(coreSlug)}-${seasonNumber}x${episodeNumber}`;
-
-  const result = await scrapeWithPage(url, () => {
-    const servers = [];
-    const languageMenus = document.querySelectorAll('.TPlayerNv > li.open_submenu');
-    const tbDivs = document.querySelectorAll('.TPlayerTb');
-    let iframeIndex = 0;
-
-    languageMenus.forEach(langMenu => {
-      const langNameText = langMenu.childNodes[0]?.textContent.trim() || langMenu.textContent.trim();
-      const langName = langNameText.split('CALIDAD')[0].trim();
-      
-      const serverLiList = langMenu.querySelectorAll('ul li, .clili');
-      serverLiList.forEach(serverLi => {
-        const serverNameFull = serverLi.textContent.trim();
-        const serverNameParts = serverNameFull.split('-').map(s => s.trim());
-        const serverName = serverNameParts[1] || serverNameFull;
-        
-        const correspondingDiv = tbDivs[iframeIndex];
-        if (correspondingDiv) {
-          const iframe = correspondingDiv.querySelector('iframe');
-          const embedUrl = iframe ? (iframe.getAttribute('data-src') || iframe.src) : '';
-          
-          if (embedUrl) {
-            let serverKey = serverName.toLowerCase().replace(/[^a-z0-9]/g, "");
-            if (serverKey.includes("streamwish") || embedUrl.includes("streamwish")) serverKey = "streamwish";
-            else if (serverKey.includes("voesx") || serverKey.includes("voe") || embedUrl.includes("voe.sx")) serverKey = "voesx";
-            else if (serverKey.includes("streamtape") || embedUrl.includes("streamtape")) serverKey = "streamtape";
-            else if (serverKey.includes("netu") || serverKey.includes("hqq") || embedUrl.includes("hqq") || embedUrl.includes("waaw") || embedUrl.includes("netu")) serverKey = "netu";
-            else if (serverKey.includes("vidhide") || serverKey.includes("vidhide") || embedUrl.includes("filelions")) serverKey = "vidhide";
-
-            servers.push({
-              name: serverName,
-              server: serverKey,
-              language: langName,
-              embedUrl: embedUrl
-            });
-          }
-        }
-        iframeIndex++;
-      });
-    });
-
-    return {
-      servers
-    };
+  const coreSlug = serieSlug.replace(/^(?:serie|anime)\//, '');
+  const url = `${BASE_URL}/episodio/${encodedSlug(coreSlug)}-${seasonNumber}x${episodeNumber}`;
+  const result = await readContent(url, $ => {
+    if (!$('h1.Title, .TPlayerNv, .TPlayerTb').length) return null;
+    return { servers: parseServers($) };
   });
-
-  return {
-    serieSlug,
-    season: Number(seasonNumber),
-    episode: Number(episodeNumber),
-    servers: repairMetadata(result?.servers || []),
-    url
-  };
+  return { serieSlug, season: seasonNumber, episode: episodeNumber, servers: repairMetadata(result?.servers || []), url };
 }
 
-module.exports = {
-  searchContent,
-  getContentInfo,
-  getEpisodeServers
-};
+module.exports = { searchContent, getContentInfo, getEpisodeServers };

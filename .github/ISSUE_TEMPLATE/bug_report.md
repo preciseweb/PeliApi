@@ -25,7 +25,7 @@ Si es aplicable, agrega capturas de pantalla para ayudar a explicar tu problema.
 
 **Entorno (por favor completa la siguiente información):**
  - OS: [ej. Windows, Ubuntu]
- - Node.js versión: [ej. 18.0.0]
+ - Node.js versión: [ej. 24.21.0]
  - Proveedor fallando: [ej. PelisPlus, RePelisHD]
 
 **Contexto adicional**

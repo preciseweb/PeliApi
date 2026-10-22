@@ -4,10 +4,13 @@
   "description": "API de scraping para PelisPlus HD",
   "main": "src/server.js",
   "type": "commonjs",
+  "engines": {
+    "node": "24.x"
+  },
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "check": "node --check src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node scripts/check.cjs",
     "test": "node --test"
   },
   "keywords": [
@@ -33,10 +36,7 @@
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "prompts": "^2.4.2",
-    "puppeteer": "^24.42.0",
+    "puppeteer": "^25.15.0",
     "unpacker": "^1.0.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
   }
 }

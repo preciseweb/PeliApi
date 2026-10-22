@@ -11,9 +11,10 @@ const rateLimit = require("express-rate-limit");
 const contentRoutes = require("./routes/content.routes");
 const downloadService = require("./services/download.service");
 const { ApiError } = require("./utils/api-error");
+const { requireApiKey } = require("./middlewares/auth");
+const { cleanup: cleanupBrowser, getBrowserStatus } = require("./utils/browser");
 
 const app = express();
-const port = Number(process.env.PORT || 5555);
 
 // Trust proxy (necessary for rate-limit behind Nginx/PM2)
 app.set("trust proxy", 1);
@@ -38,7 +39,11 @@ app.use(
 );
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-app.use(morgan("dev"));
+// Query strings may contain API keys or signed media URLs. Log only paths.
+morgan.token("safe-path", req => req.path);
+app.use(morgan(":method :safe-path :status :response-time ms", {
+  skip: () => process.env.NODE_ENV === "test",
+}));
 
 // Rate Limiting
 const apiLimiter = rateLimit({
@@ -46,6 +51,7 @@ const apiLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: () => String(process.env.DISABLE_RATE_LIMIT).trim().toLowerCase() === "true",
   message: { success: false, message: "Demasiadas peticiones. Espera 1 minuto." }
 });
 
@@ -54,6 +60,7 @@ const scrapeLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: () => String(process.env.DISABLE_RATE_LIMIT).trim().toLowerCase() === "true",
   message: { success: false, message: "Límite de scrapeo alcanzado. Espera 1 minuto." }
 });
 
@@ -105,34 +112,20 @@ app.get("/api", (_req, res) => {
 });
 
 app.get("/health", async (_req, res) => {
-  const { exec } = require("child_process");
-  const util = require("util");
-  const execAsync = util.promisify(exec);
-  
-  let chromeCount = 0;
-  try {
-    if (process.platform === "win32") {
-      const { stdout } = await execAsync('tasklist /FI "IMAGENAME eq chrome.exe" /NH || true');
-      if (stdout.includes("No tasks are running") || stdout.includes("No se ejecutan tareas")) {
-        chromeCount = 0;
-      } else {
-        chromeCount = stdout.split("\n").filter(line => line.toLowerCase().includes("chrome.exe")).length;
-      }
-    } else {
-      const { stdout } = await execAsync("pgrep -c chrome || true");
-      chromeCount = parseInt(stdout.trim()) || 0;
-    }
-  } catch (e) {
-    chromeCount = -1;
-  }
-
+  const browser = await getBrowserStatus();
   res.status(200).json({
     success: true,
     status: "ok",
-    chromeProcesses: chromeCount,
-    memoryWarning: chromeCount > 10
+    // Count the process owned by this service, rather than executing a shell
+    // command for every health probe or counting unrelated system browsers.
+    chromeProcesses: browser.connected ? 1 : 0,
+    memoryWarning: process.memoryUsage().rss > 450 * 1024 * 1024,
+    browser,
   });
 });
+
+app.use("/api/v1/content", requireApiKey);
+app.use("/api/pelisplus", requireApiKey);
 
 app.use("/api/v1/content", contentRoutes);
 app.use("/api/pelisplus", contentRoutes);
@@ -143,8 +136,11 @@ app.use((_req, _res, next) => {
 });
 
 // Error handler
-app.use((error, _req, res, _next) => {
-  const statusCode = error.statusCode || 500;
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
+  const providedStatus = Number(error.statusCode || error.status);
+  const statusCode = Number.isInteger(providedStatus) && providedStatus >= 400 && providedStatus <= 599
+    ? providedStatus : 500;
   const response = {
     success: false,
     message: error.message || "Error interno del servidor",
@@ -155,20 +151,67 @@ app.use((error, _req, res, _next) => {
   res.status(statusCode).json(response);
 });
 
-// Check yt-dlp availability at startup (non-blocking)
-const ytdlpResolver = require("./utils/resolvers/ytdlp.resolver");
-ytdlpResolver.checkYtdlpAvailability().then(() => {
-  if (ytdlpResolver.isAvailable) {
-    console.log(`[SYSTEM] yt-dlp detectado con éxito. Utilizando como resolvedor primario.`);
-  } else {
-    console.log(`[SYSTEM] yt-dlp no está instalado o no se encuentra en el PATH. Se usará Puppeteer como fallback.`);
-  }
-});
+function startServer(options = {}) {
+  const port = options.port ?? Number(process.env.PORT || 5555);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("PORT debe ser un puerto válido");
+  const server = app.listen(port, options.host, () => {
+    console.log(`PeliApi listening on port ${server.address().port}`);
+  });
+  server.timeout = 35000;
+  server.keepAliveTimeout = 35000;
+  server.headersTimeout = 36000;
+  server.requestTimeout = 35000;
+  return server;
+}
 
-const server = app.listen(port, () => {
-  console.log(`PeliApi listening on http://localhost:${port}`);
-});
+function registerShutdown(server, { timeoutMs = 10000 } = {}) {
+  const gracePeriod = Number.isInteger(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 10000) : 10000;
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    const deadline = setTimeout(() => {
+      server.closeAllConnections?.();
+      // Last resort only after the graceful window has elapsed.
+      process.exit(process.exitCode || 0);
+    }, gracePeriod);
+    deadline.unref();
+    try {
+      await Promise.all([
+        new Promise(resolve => {
+          server.close(resolve);
+          server.closeIdleConnections?.();
+        }),
+        cleanupBrowser(),
+        downloadService.cleanup?.(),
+      ]);
+      process.exitCode = 0;
+    } catch (_error) {
+      process.exitCode = 1;
+    }
+    // Keep this unref'd watchdog until natural process exit. Background streams
+    // or child processes can outlive server.close(), even after cleanup returns.
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
 
-server.timeout = 35000;
-server.keepAliveTimeout = 35000;
-server.headersTimeout = 36000;
+if (require.main === module) {
+  // Check yt-dlp availability at startup (non-blocking).
+  const ytdlpResolver = require("./utils/resolvers/ytdlp.resolver");
+  ytdlpResolver.checkYtdlpAvailability().then(available => {
+    console.log(available
+      ? "[SYSTEM] yt-dlp disponible como resolvedor primario."
+      : "[SYSTEM] yt-dlp no está instalado. Los resolvedores HTTP siguen disponibles.");
+  }).catch(() => console.error("[SYSTEM] No se pudo comprobar yt-dlp."));
+
+  const server = startServer();
+  server.on("error", error => {
+    console.error(`[SYSTEM] No se pudo iniciar el servidor: ${error.code || "ERROR"}`);
+    process.exitCode = 1;
+    void cleanupBrowser();
+  });
+  registerShutdown(server);
+}
+
+module.exports = { app, startServer, registerShutdown };
